@@ -1,0 +1,188 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─── Enums ────────────────────────────────────────────────────────────────────
+
+enum TradeStatus {
+  pending_supplier
+  pending_funding
+  funded
+  in_progress
+  milestone_1_released
+  milestone_2_released
+  completed
+  disputed
+  cancelled
+  refunded
+}
+
+enum MilestoneStatus {
+  pending
+  proof_uploaded
+  released
+  disputed
+}
+
+enum DisputeStatus {
+  open
+  under_review
+  resolved_buyer
+  resolved_supplier
+  resolved_split
+}
+
+enum UserRole {
+  buyer
+  supplier
+  both
+}
+
+// ─── Models ───────────────────────────────────────────────────────────────────
+
+model User {
+  id                String   @id @default(uuid())
+  wallet_address    String   @unique
+  display_name      String?
+  email             String?
+  telegram_chat_id  String?
+  telegram_username String?
+  role              UserRole?
+  country           String?
+  business_name     String?
+  reputation_score  Decimal  @default(5.0)
+  total_trades      Int      @default(0)
+  completed_trades  Int      @default(0)
+  disputed_trades   Int      @default(0)
+  created_at        DateTime @default(now())
+
+  trades_as_buyer    Trade[]            @relation("BuyerTrades")
+  trades_as_supplier Trade[]            @relation("SupplierTrades")
+  messages           TradeMessage[]
+  disputes_raised    Dispute[]
+  reputation_events  ReputationEvent[]
+
+  @@map("users")
+}
+
+model Trade {
+  id                 String      @id @default(uuid())
+  trade_number       String      @unique
+  buyer_id           String
+  supplier_id        String?
+  supplier_invite_token String?  @unique
+  goods_description  String
+  goods_category     String?
+  quantity           String?
+  total_amount_usdc  Decimal
+  escrow_pubkey      String?
+  status             TradeStatus @default(pending_supplier)
+  corridor           String      @default("NG-UAE")
+  pickup_location    String?
+  dropoff_location   String?
+  buyer_contact_name String?
+  buyer_contact_phone String?
+  supplier_contact_name String?
+  supplier_contact_phone String?
+  expected_ship_date DateTime?
+  expected_delivery_date DateTime?
+  shipping_reference String?
+  incoterm           String?
+  notes              String?
+  created_at         DateTime    @default(now())
+  updated_at         DateTime    @updatedAt
+
+  buyer     User  @relation("BuyerTrades", fields: [buyer_id], references: [id])
+  supplier  User? @relation("SupplierTrades", fields: [supplier_id], references: [id])
+
+  milestones        Milestone[]
+  messages          TradeMessage[]
+  disputes          Dispute[]
+  reputation_events ReputationEvent[]
+  receipt           TradeReceipt?
+
+  @@map("trades")
+}
+
+model Milestone {
+  id                  String          @id @default(uuid())
+  trade_id            String
+  milestone_number    Int
+  description         String
+  release_percentage  Int
+  release_amount_usdc Decimal?
+  status              MilestoneStatus @default(pending)
+  proof_url           String?
+  proof_uploaded_at   DateTime?
+  released_at         DateTime?
+  tx_signature        String?
+
+  trade    Trade     @relation(fields: [trade_id], references: [id])
+  disputes Dispute[]
+
+  @@unique([trade_id, milestone_number])
+  @@map("milestones")
+}
+
+model Dispute {
+  id            String        @id @default(uuid())
+  trade_id      String
+  milestone_id  String?
+  raised_by     String
+  reason        String
+  status        DisputeStatus @default(open)
+  arbiter_notes String?
+  resolved_at   DateTime?
+  created_at    DateTime      @default(now())
+
+  trade     Trade      @relation(fields: [trade_id], references: [id])
+  milestone Milestone? @relation(fields: [milestone_id], references: [id])
+  raiser    User       @relation(fields: [raised_by], references: [id])
+
+  @@map("disputes")
+}
+
+model ReputationEvent {
+  id         String   @id @default(uuid())
+  user_id    String
+  trade_id   String
+  event_type String
+  score_delta Decimal
+  created_at DateTime @default(now())
+
+  user  User  @relation(fields: [user_id], references: [id])
+  trade Trade @relation(fields: [trade_id], references: [id])
+
+  @@map("reputation_events")
+}
+
+model TradeReceipt {
+  id           String   @id @default(uuid())
+  trade_id     String   @unique
+  receipt_hash String?
+  tx_signature String?
+  issued_at    DateTime @default(now())
+
+  trade Trade @relation(fields: [trade_id], references: [id])
+
+  @@map("trade_receipts")
+}
+
+
+model TradeMessage {
+  id         String   @id @default(uuid())
+  trade_id   String
+  sender_id  String
+  content    String
+  created_at DateTime @default(now())
+
+  trade  Trade @relation(fields: [trade_id], references: [id], onDelete: Cascade)
+  sender User  @relation(fields: [sender_id], references: [id])
+
+  @@index([trade_id])
+  @@map("trade_messages")
+}
