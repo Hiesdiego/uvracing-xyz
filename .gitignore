@@ -3,6 +3,7 @@
 target
 **/*.rs.bk
 node_modules
+.pnpm-store
 test-ledger
 .yarn
 .surfpool
