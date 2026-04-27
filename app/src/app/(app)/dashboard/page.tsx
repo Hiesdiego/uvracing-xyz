@@ -1,3 +1,5 @@
+//tradeos/app/src/app/(app)/dashboard/page.tsx
+
 "use client";
 
 import { usePrivy } from "@privy-io/react-auth";
@@ -119,10 +121,34 @@ export default function DashboardPage() {
       t.milestones?.some((m) => m.status === "proof_uploaded") ||
       t.status === "pending_funding"
   );
-  const totalEscrowed = activeTrades.reduce(
-    (sum, t) => sum + Number(t.total_amount_usdc),
-    0
-  );
+  const totalEscrowed = trades.reduce((sum, trade) => {
+    const statusHasLockedEscrow = [
+      "funded",
+      "in_progress",
+      "milestone_1_released",
+      "milestone_2_released",
+      "disputed",
+    ].includes(trade.status);
+
+    if (!statusHasLockedEscrow) {
+      return sum;
+    }
+
+    const releasedAmount =
+      trade.milestones?.reduce((releasedSum, milestone) => {
+        if (milestone.status !== "released") return releasedSum;
+        return (
+          releasedSum +
+          (Number(trade.total_amount_usdc) * milestone.release_percentage) / 100
+        );
+      }, 0) ?? 0;
+
+    const lockedAmount = Math.max(
+      0,
+      Number(trade.total_amount_usdc) - releasedAmount
+    );
+    return sum + lockedAmount;
+  }, 0);
   const completedTrades = trades.filter((t) => t.status === "completed");
 
   const displayName =

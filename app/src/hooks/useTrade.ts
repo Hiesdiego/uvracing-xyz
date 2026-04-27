@@ -1,6 +1,8 @@
+//tradeos/app/src/hooks/useTrade.ts
+
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { usePrivy } from "@privy-io/react-auth";
 import toast from "react-hot-toast";
 import type { Trade } from "@/types";
@@ -24,9 +26,32 @@ async function apiFetch(
   return data;
 }
 
+/**
+ * useStableAccessToken
+ *
+ * THE FIX for the auto-refresh / infinite polling loop.
+ *
+ * Problem: Privy's `getAccessToken` changes reference whenever Privy
+ * updates its internal auth state (token refresh, re-render after a
+ * successful fetch, etc.). Placing it in useCallback deps causes:
+ *   getAccessToken changes → fetchTrade new ref → useEffect fires
+ *   → setLoading(true) → skeleton flash → fetch → setTrade → re-render
+ *   → getAccessToken changes again → loop.
+ *
+ * Solution: store getAccessToken in a ref that updates every render.
+ * Expose a stable wrapper that never changes reference, so it's safe
+ * to use in useCallback without including it in deps.
+ */
+function useStableAccessToken() {
+  const { getAccessToken } = usePrivy();
+  const ref = useRef(getAccessToken);
+  ref.current = getAccessToken; // always current, no dep array needed
+  return useCallback(() => ref.current(), []);
+}
+
 /** Fetches all trades for the current user */
 export function useTrades() {
-  const { getAccessToken } = usePrivy();
+  const getToken = useStableAccessToken();
   const [trades, setTrades] = useState<Trade[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -35,7 +60,7 @@ export function useTrades() {
     setLoading(true);
     setError(null);
     try {
-      const token = await getAccessToken();
+      const token = await getToken();
       if (!token) throw new Error("Not authenticated");
       const data = await apiFetch("/api/trades", token);
       setTrades(data);
@@ -45,7 +70,7 @@ export function useTrades() {
     } finally {
       setLoading(false);
     }
-  }, [getAccessToken]);
+  }, [getToken]); // getToken is stable — this callback never needlessly recreates
 
   useEffect(() => {
     fetchTrades();
@@ -54,47 +79,67 @@ export function useTrades() {
   return { trades, loading, error, refetch: fetchTrades };
 }
 
-/** Fetches a single trade by ID */
+/** Fetches a single trade by ID, with silent background-refetch support */
 export function useTradeDetail(tradeId: string, inviteToken?: string | null) {
-  const { getAccessToken } = usePrivy();
+  const getToken = useStableAccessToken();
   const [trade, setTrade] = useState<Trade | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(true); // true only for first load
   const [error, setError] = useState<string | null>(null);
+  const hasLoadedRef = useRef(false);
 
-  const fetchTrade = useCallback(async () => {
-    if (!tradeId) return;
-    setLoading(true);
-    setError(null);
-    try {
-      const token = await getAccessToken();
-      if (!token) throw new Error("Not authenticated");
-      const inviteQuery = inviteToken
-        ? `?invite_token=${encodeURIComponent(inviteToken)}`
-        : "";
-      const data = await apiFetch(`/api/trades/${tradeId}${inviteQuery}`, token);
-      setTrade(data);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : "Failed to load trade";
-      setError(msg);
-    } finally {
-      setLoading(false);
-    }
-  }, [tradeId, getAccessToken, inviteToken]);
+  /**
+   * fetchTrade(silent?)
+   * silent=true  → data updates in background, no skeleton shown (used by polling)
+   * silent=false → shows loading skeleton (only on initial mount / trade change)
+   */
+  const fetchTrade = useCallback(
+    async (silent = false) => {
+      if (!tradeId) return;
+      if (!silent) setLoading(true);
+      setError(null);
 
+      try {
+        const token = await getToken();
+        if (!token) throw new Error("Not authenticated");
+        const inviteQuery = inviteToken
+          ? `?invite_token=${encodeURIComponent(inviteToken)}`
+          : "";
+        const data = await apiFetch(
+          `/api/trades/${tradeId}${inviteQuery}`,
+          token
+        );
+        setTrade(data);
+        hasLoadedRef.current = true;
+      } catch (err) {
+        const msg =
+          err instanceof Error ? err.message : "Failed to load trade";
+        if (!hasLoadedRef.current) setError(msg); // only show error on first load
+      } finally {
+        if (!silent) setLoading(false);
+      }
+    },
+    [tradeId, inviteToken, getToken]
+  );
+
+  // Initial fetch — reset hasLoadedRef so skeleton shows if tradeId changes
   useEffect(() => {
-    fetchTrade();
+    hasLoadedRef.current = false;
+    fetchTrade(false);
   }, [fetchTrade]);
 
-  return { trade, loading, error, refetch: fetchTrade };
+  // Public refetch: always silent so background polls don't flash the skeleton
+  const refetch = useCallback(() => fetchTrade(true), [fetchTrade]);
+
+  return { trade, loading, error, refetch };
 }
 
 /** Mutations — create, accept, fund, proof, release, dispute */
 export function useTradeActions() {
-  const { getAccessToken } = usePrivy();
+  const getToken = useStableAccessToken();
   const [loading, setLoading] = useState(false);
 
-  async function getToken() {
-    const token = await getAccessToken();
+  async function getTokenOrThrow() {
+    const token = await getToken();
     if (!token) throw new Error("Not authenticated");
     return token;
   }
@@ -120,7 +165,7 @@ export function useTradeActions() {
   }): Promise<Trade> {
     setLoading(true);
     try {
-      const token = await getToken();
+      const token = await getTokenOrThrow();
       const trade = await apiFetch("/api/trades", token, {
         method: "POST",
         body: JSON.stringify(payload),
@@ -139,7 +184,7 @@ export function useTradeActions() {
   async function acceptTrade(tradeId: string, invite_token: string): Promise<Trade> {
     setLoading(true);
     try {
-      const token = await getToken();
+      const token = await getTokenOrThrow();
       const trade = await apiFetch(`/api/trades/${tradeId}/accept`, token, {
         method: "POST",
         body: JSON.stringify({ invite_token }),
@@ -158,7 +203,7 @@ export function useTradeActions() {
   async function declineTrade(tradeId: string, invite_token: string): Promise<Trade> {
     setLoading(true);
     try {
-      const token = await getToken();
+      const token = await getTokenOrThrow();
       const trade = await apiFetch(`/api/trades/${tradeId}/decline`, token, {
         method: "POST",
         body: JSON.stringify({ invite_token }),
@@ -181,7 +226,7 @@ export function useTradeActions() {
   ): Promise<Trade> {
     setLoading(true);
     try {
-      const token = await getToken();
+      const token = await getTokenOrThrow();
       return await apiFetch(`/api/trades/${tradeId}/fund`, token, {
         method: "POST",
         body: JSON.stringify({ escrow_pubkey, tx_signature }),
@@ -202,7 +247,7 @@ export function useTradeActions() {
   ): Promise<void> {
     setLoading(true);
     try {
-      const token = await getToken();
+      const token = await getTokenOrThrow();
       await apiFetch(`/api/trades/${tradeId}/proof`, token, {
         method: "POST",
         body: JSON.stringify({ milestone_number, proof_url }),
@@ -224,7 +269,7 @@ export function useTradeActions() {
   ): Promise<Trade> {
     setLoading(true);
     try {
-      const token = await getToken();
+      const token = await getTokenOrThrow();
       return await apiFetch(`/api/trades/${tradeId}/release`, token, {
         method: "POST",
         body: JSON.stringify({ milestone_number, tx_signature }),
@@ -245,7 +290,7 @@ export function useTradeActions() {
   ): Promise<void> {
     setLoading(true);
     try {
-      const token = await getToken();
+      const token = await getTokenOrThrow();
       await apiFetch(`/api/trades/${tradeId}/dispute`, token, {
         method: "POST",
         body: JSON.stringify({ milestone_number, reason }),

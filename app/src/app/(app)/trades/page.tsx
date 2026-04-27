@@ -1,3 +1,5 @@
+//tradeos/app/src/(app)/trades/page.tsx
+
 "use client";
 
 import { useState } from "react";

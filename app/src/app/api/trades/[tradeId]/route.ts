@@ -8,45 +8,62 @@ import { safeJson, validationErrorResponse } from "@/lib/api/validation";
 import {
   PrivyClient,
   type LinkedAccount,
-  type User as PrivyUser,
 } from "@privy-io/node";
 
 type Context = { params: { tradeId: string } };
 type GetContext = { params: Promise<{ tradeId: string }> };
 
+/**
+ * Single PrivyClient instance — reused across requests.
+ * JWT verification is local (no network). Creating this per-request is wasteful.
+ */
 const privy = new PrivyClient({
   appId: process.env.NEXT_PUBLIC_PRIVY_APP_ID!,
   appSecret: process.env.PRIVY_APP_SECRET!,
 });
 
-type PrivyWalletAccount = Extract<LinkedAccount, { type: "wallet" }>;
+type PrivyLinkedAccount = LinkedAccount & { chain_type?: string };
 
-function getWalletAddress(privyUser: PrivyUser) {
-  return privyUser.linked_accounts.find(
-    (account): account is PrivyWalletAccount => account.type === "wallet"
-  )?.address;
+/**
+ * FIX: Replace `privy.users()._get()` (private API, causes 57s hangs)
+ * with JWT claim extraction — wallet address is already in the token payload.
+ */
+function extractWalletFromClaims(claims: Record<string, unknown>): string | null {
+  const linked = claims.linked_accounts as PrivyLinkedAccount[] | undefined;
+  if (!linked || !Array.isArray(linked)) return null;
+
+  const solana = linked.find(
+    (a) => a.type === "wallet" && (a as {chain_type?: string}).chain_type === "solana"
+  );
+  if (solana && "address" in solana) return (solana as {address: string}).address;
+
+  const anyWallet = linked.find((a) => a.type === "wallet");
+  if (anyWallet && "address" in anyWallet) return (anyWallet as {address: string}).address;
+
+  return null;
 }
 
 async function getOptionalAuthedUser(req: NextRequest) {
   const authHeader = req.headers.get("authorization");
-  if (!authHeader?.startsWith("Bearer ")) {
-    return null;
-  }
+  if (!authHeader?.startsWith("Bearer ")) return null;
 
   try {
     const token = authHeader.replace("Bearer ", "");
-    const verifiedClaims = await privy.utils().auth().verifyAccessToken(token);
-    const privyUser = await privy.users()._get(verifiedClaims.user_id);
-    const walletAddress = getWalletAddress(privyUser);
-    if (!walletAddress) {
-      return null;
-    }
+    // Local JWT verification — no Privy API call
+    const verifiedClaims = await privy
+      .utils()
+      .auth()
+      .verifyAccessToken(token);
+
+    // Extract wallet from JWT payload — eliminates the 57s _get() hang
+    const walletAddress = extractWalletFromClaims(
+      verifiedClaims as unknown as Record<string, unknown>
+    );
+    if (!walletAddress) return null;
 
     const user = await prisma.user.upsert({
       where: { wallet_address: walletAddress },
-      create: {
-        wallet_address: walletAddress,
-      },
+      create: { wallet_address: walletAddress },
       update: {},
     });
     return user;
@@ -55,7 +72,7 @@ async function getOptionalAuthedUser(req: NextRequest) {
   }
 }
 
-// GET /api/trades/[tradeId] - fetch a single trade with all relations
+// GET /api/trades/[tradeId] — fetch a single trade with all relations
 export async function GET(req: NextRequest, ctx: GetContext) {
   const { tradeId } = await ctx.params;
   const authedUser = await getOptionalAuthedUser(req);
@@ -78,7 +95,6 @@ export async function GET(req: NextRequest, ctx: GetContext) {
     return NextResponse.json({ error: "Trade not found" }, { status: 404 });
   }
 
-  // Only buyer or supplier can view the trade.
   const isMember =
     authedUser !== null &&
     (trade.buyer_id === authedUser.id || trade.supplier_id === authedUser.id);
@@ -103,7 +119,7 @@ export async function GET(req: NextRequest, ctx: GetContext) {
   });
 }
 
-// PATCH /api/trades/[tradeId] - guarded updates only
+// PATCH /api/trades/[tradeId] — guarded updates only
 export const PATCH = withAuth(async (req: AuthedRequest, ctx: Context) => {
   try {
     const { tradeId } = ctx.params;
@@ -140,7 +156,6 @@ export const PATCH = withAuth(async (req: AuthedRequest, ctx: Context) => {
       );
     }
 
-    // Guardrail: only buyers can cancel pre-funded trades from this generic endpoint.
     if (status !== "cancelled") {
       return NextResponse.json(
         {
@@ -156,10 +171,7 @@ export const PATCH = withAuth(async (req: AuthedRequest, ctx: Context) => {
         { status: 403 }
       );
     }
-    if (![
-      "pending_supplier",
-      "pending_funding",
-    ].includes(trade.status)) {
+    if (!["pending_supplier", "pending_funding"].includes(trade.status)) {
       return NextResponse.json(
         {
           error:

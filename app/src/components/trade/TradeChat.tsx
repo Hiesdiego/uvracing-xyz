@@ -59,13 +59,32 @@ export function TradeChat({
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const previousMessageCountRef = useRef(0);
 
+  /**
+   * FIX: Store getAccessToken in a ref so it's always current without
+   * being a useCallback dependency. This breaks the feedback loop:
+   *
+   *   OLD (broken):
+   *   getAccessToken changes → fetchMessages new ref → useEffect fires
+   *   → API call → response → re-render → getAccessToken changes → repeat
+   *
+   *   NEW (fixed):
+   *   getAccessTokenRef always points to latest fn, fetchMessages ref is
+   *   stable, neither useEffect ever fires due to auth state changes.
+   */
+  const getAccessTokenRef = useRef(getAccessToken);
+  getAccessTokenRef.current = getAccessToken;
+
   const walletAddress =
     user?.wallet?.address ??
     user?.linkedAccounts?.find((a) => a.type === "wallet")?.address;
 
+  /**
+   * fetchMessages — stable reference, only changes if tradeId changes.
+   * Does NOT include getAccessToken in deps (uses ref instead).
+   */
   const fetchMessages = useCallback(async () => {
     try {
-      const token = await getAccessToken();
+      const token = await getAccessTokenRef.current();
       if (!token) return;
       const res = await fetch(`/api/trades/${tradeId}/messages`, {
         headers: { Authorization: `Bearer ${token}` },
@@ -73,27 +92,30 @@ export function TradeChat({
       if (!res.ok) return;
       const data = (await res.json()) as Message[];
       setMessages((prev) => {
+        // Only update state if something actually changed —
+        // avoids re-renders when polling returns identical data
         const prevLast = prev[prev.length - 1]?.id;
         const nextLast = data[data.length - 1]?.id;
-        if (prev.length === data.length && prevLast === nextLast) {
-          return prev;
-        }
+        if (prev.length === data.length && prevLast === nextLast) return prev;
         return data;
       });
     } catch {
-      // no-op: chat polling should not break page
+      // no-op: chat polling should never break the page
     }
-  }, [tradeId, getAccessToken]);
+  }, [tradeId]); // tradeId is the only real dependency
 
+  // Initial fetch — runs once on mount and when tradeId changes
   useEffect(() => {
     fetchMessages().finally(() => setLoading(false));
   }, [fetchMessages]);
 
+  // Background polling — stable interval, never restarts due to auth changes
   useEffect(() => {
     const interval = setInterval(fetchMessages, 20_000);
     return () => clearInterval(interval);
-  }, [fetchMessages]);
+  }, [fetchMessages]); // fetchMessages only changes when tradeId changes
 
+  // Scroll to bottom when new messages arrive
   useEffect(() => {
     if (messages.length > previousMessageCountRef.current) {
       bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -106,7 +128,7 @@ export function TradeChat({
 
     setSending(true);
     try {
-      const token = await getAccessToken();
+      const token = await getAccessTokenRef.current();
       if (!token) return;
       const res = await fetch(`/api/trades/${tradeId}/messages`, {
         method: "POST",
@@ -124,7 +146,7 @@ export function TradeChat({
         textareaRef.current?.focus();
       }
     } catch {
-      // no-op: error toasts handled by API hooks elsewhere
+      // no-op
     } finally {
       setSending(false);
     }
@@ -172,7 +194,10 @@ export function TradeChat({
             {Array.from({ length: 3 }).map((_, i) => (
               <div
                 key={i}
-                className={cn("flex", i % 2 === 0 ? "justify-start" : "justify-end")}
+                className={cn(
+                  "flex",
+                  i % 2 === 0 ? "justify-start" : "justify-end"
+                )}
               >
                 <Skeleton className="h-12 w-48 rounded-xl" />
               </div>
@@ -225,7 +250,9 @@ export function TradeChat({
                           {senderLabel}
                         </p>
                       )}
-                      <p className="leading-relaxed break-words">{msg.content}</p>
+                      <p className="leading-relaxed break-words">
+                        {msg.content}
+                      </p>
                       <p
                         className={cn(
                           "text-[10px] mt-1",

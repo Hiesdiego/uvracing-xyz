@@ -1,6 +1,8 @@
+//tradeos/app/src/app/(app)/trades/[tradeId]/page.tsx
+
 "use client";
 
-import { use, useEffect, useMemo, useRef, useState } from "react";
+import { use, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
@@ -34,7 +36,11 @@ import {
 } from "@/lib/utils";
 import { TRADE_STATUS_COLORS, TRADE_STATUS_LABELS } from "@/lib/constants";
 import type { Milestone, Trade } from "@/types";
+import { WalletDebugPanel } from "@/components/debug/WalletDebugPanel";
 
+// ---------------------------------------------------------------------------
+// MilestoneStep
+// ---------------------------------------------------------------------------
 function MilestoneStep({
   milestone,
   trade,
@@ -159,9 +165,12 @@ function MilestoneStep({
         <div className="flex flex-wrap gap-2">
           {isSupplier &&
             milestone.status === "pending" &&
-            ["funded", "in_progress", "milestone_1_released", "milestone_2_released"].includes(
-              trade.status
-            ) && (
+            [
+              "funded",
+              "in_progress",
+              "milestone_1_released",
+              "milestone_2_released",
+            ].includes(trade.status) && (
               <>
                 {showProofInput ? (
                   <div className="flex items-center gap-2 w-full">
@@ -236,6 +245,9 @@ function MilestoneStep({
   );
 }
 
+// ---------------------------------------------------------------------------
+// CopyButton
+// ---------------------------------------------------------------------------
 function CopyButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false);
   return (
@@ -256,6 +268,9 @@ function CopyButton({ text }: { text: string }) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// TradeDetailPage
+// ---------------------------------------------------------------------------
 export default function TradeDetailPage({
   params,
 }: {
@@ -268,7 +283,10 @@ export default function TradeDetailPage({
   const createdFromIntent = searchParams.get("created") === "1";
 
   const { user } = usePrivy();
-  const { trade, loading, error, refetch } = useTradeDetail(tradeId, inviteToken);
+  const { trade, loading, error, refetch } = useTradeDetail(
+    tradeId,
+    inviteToken
+  );
   const {
     recordFunding,
     uploadProof,
@@ -280,6 +298,7 @@ export default function TradeDetailPage({
   const {
     handleFundEscrow,
     handleReleaseMilestone,
+    walletReady,
     loading: chainLoading,
   } = useEscrow();
 
@@ -307,20 +326,39 @@ export default function TradeDetailPage({
     previousStatusRef.current = trade.status;
   }, [trade, isBuyer]);
 
+  // ---------------------------------------------------------------------------
+  // FIX: stable polling — use a ref to hold the latest refetch so the
+  // interval is NOT re-created on every render.
+  //
+  // The original code had `refetch` in the useEffect dependency array.
+  // If useTradeDetail returns a new `refetch` reference each render (which
+  // is the default when not wrapped in useCallback inside the hook), the
+  // effect fires on every render, clearing and re-creating the interval
+  // constantly. That caused the continuous "full refresh" experience.
+  //
+  // The ref pattern below keeps the interval stable for the entire life of
+  // the "pending" stages without requiring a change inside useTradeDetail.
+  // ---------------------------------------------------------------------------
+  const refetchRef = useRef(refetch);
+  useEffect(() => {
+    refetchRef.current = refetch;
+  });
+
   const tradeStatus = trade?.status ?? null;
   const shouldPollBuyerStages =
     Boolean(isBuyer) &&
     (tradeStatus === "pending_supplier" || tradeStatus === "pending_funding");
 
   useEffect(() => {
-    if (!shouldPollBuyerStages) {
-      return;
-    }
+    if (!shouldPollBuyerStages) return;
+
     const timer = setInterval(() => {
-      refetch();
-    }, 20000);
+      // Always calls the latest refetch without putting it in deps
+      refetchRef.current();
+    }, 20_000); // 20 s — enough for UX without hammering the DB
+
     return () => clearInterval(timer);
-  }, [shouldPollBuyerStages, refetch]);
+  }, [shouldPollBuyerStages]); // ← refetch intentionally omitted; handled by ref
 
   const statusLabel = trade
     ? TRADE_STATUS_LABELS[trade.status] ?? trade.status
@@ -338,18 +376,26 @@ export default function TradeDetailPage({
     if (!trade) return "-";
     if (trade.status === "pending_supplier") return "Supplier";
     if (trade.status === "pending_funding") return "Buyer";
-    if (["funded", "in_progress", "milestone_1_released", "milestone_2_released"].includes(trade.status)) return "Supplier / Buyer";
+    if (
+      [
+        "funded",
+        "in_progress",
+        "milestone_1_released",
+        "milestone_2_released",
+      ].includes(trade.status)
+    )
+      return "Supplier / Buyer";
     if (trade.status === "disputed") return "Arbiter";
     return "None";
   }, [trade]);
 
-  async function copyInviteLink() {
+  const copyInviteLink = useCallback(async () => {
     if (!inviteLink) return;
     await navigator.clipboard.writeText(inviteLink);
     toast.success("Supplier invite link copied");
-  }
+  }, [inviteLink]);
 
-  async function onAcceptTrade() {
+  const onAcceptTrade = useCallback(async () => {
     if (!trade || !inviteToken) return;
     try {
       await acceptTrade(trade.id, inviteToken);
@@ -358,9 +404,9 @@ export default function TradeDetailPage({
     } catch {
       // handled by hook toast
     }
-  }
+  }, [trade, inviteToken, acceptTrade, router, refetch]);
 
-  async function onDeclineTrade() {
+  const onDeclineTrade = useCallback(async () => {
     if (!trade || !inviteToken) return;
     try {
       await declineTrade(trade.id, inviteToken);
@@ -368,41 +414,53 @@ export default function TradeDetailPage({
     } catch {
       // handled by hook toast
     }
-  }
+  }, [trade, inviteToken, declineTrade, router]);
 
-  async function onFundEscrow() {
+  const onFundEscrow = useCallback(async () => {
     if (!trade) return;
     try {
       const { fundTx, escrowPubkey } = await handleFundEscrow(trade);
       await recordFunding(trade.id, escrowPubkey, fundTx);
       refetch();
     } catch {
-      // handled by hook toast
+      // handled by useEscrow toast
     }
-  }
+  }, [trade, handleFundEscrow, recordFunding, refetch]);
 
-  async function onRelease(milestoneNumber: number) {
-    if (!trade) return;
-    try {
-      const tx = await handleReleaseMilestone(trade, milestoneNumber - 1);
-      await recordRelease(trade.id, milestoneNumber, tx);
+  const onRelease = useCallback(
+    async (milestoneNumber: number) => {
+      if (!trade) return;
+      try {
+        const tx = await handleReleaseMilestone(trade, milestoneNumber - 1);
+        await recordRelease(trade.id, milestoneNumber, tx);
+        refetch();
+      } catch {
+        // handled by useEscrow toast
+      }
+    },
+    [trade, handleReleaseMilestone, recordRelease, refetch]
+  );
+
+  const onDispute = useCallback(
+    (milestoneNumber: number) => {
+      if (!trade) return;
+      router.push(`/trades/${trade.id}/dispute?milestone=${milestoneNumber}`);
+    },
+    [trade, router]
+  );
+
+  const onProofUpload = useCallback(
+    async (milestoneNumber: number, url: string) => {
+      if (!trade) return;
+      await uploadProof(trade.id, milestoneNumber, url);
       refetch();
-    } catch {
-      // handled by hook toast
-    }
-  }
+    },
+    [trade, uploadProof, refetch]
+  );
 
-  function onDispute(milestoneNumber: number) {
-    if (!trade) return;
-    router.push(`/trades/${trade.id}/dispute?milestone=${milestoneNumber}`);
-  }
-
-  async function onProofUpload(milestoneNumber: number, url: string) {
-    if (!trade) return;
-    await uploadProof(trade.id, milestoneNumber, url);
-    refetch();
-  }
-
+  // ---------------------------------------------------------------------------
+  // Render
+  // ---------------------------------------------------------------------------
   if (loading) {
     return (
       <div className="max-w-2xl space-y-6 animate-fade-in">
@@ -416,8 +474,13 @@ export default function TradeDetailPage({
   if (error || !trade) {
     return (
       <div className="text-center py-20">
-        <p className="text-muted-foreground text-sm">{error ?? "Trade not found"}</p>
-        <Link href="/trades" className="text-gold text-sm hover:underline mt-2 inline-block">
+        <p className="text-muted-foreground text-sm">
+          {error ?? "Trade not found"}
+        </p>
+        <Link
+          href="/trades"
+          className="text-gold text-sm hover:underline mt-2 inline-block"
+        >
           Back to trades
         </Link>
       </div>
@@ -438,20 +501,27 @@ export default function TradeDetailPage({
         <div className="trade-card border-[hsl(var(--gold)/0.4)] bg-[hsl(var(--gold)/0.03)] space-y-2">
           <p className="text-sm font-semibold text-gold">Trade intent created</p>
           <p className="text-xs text-muted-foreground">
-            Next steps: 1) send supplier invite link, 2) wait for supplier to join,
-            3) fund escrow once status changes to Awaiting Funding.
+            Next steps: 1) send supplier invite link, 2) wait for supplier to
+            join, 3) fund escrow once status changes to Awaiting Funding.
           </p>
         </div>
       )}
 
+      {/* ── Trade summary card ─────────────────────────────────────────── */}
       <div className="trade-card space-y-4">
         <div className="flex items-start justify-between">
           <div>
             <div className="flex items-center gap-2 mb-1">
-              <h1 className="text-lg font-bold font-mono">{trade.trade_number}</h1>
-              <span className="text-xs text-muted-foreground font-mono">{trade.corridor}</span>
+              <h1 className="text-lg font-bold font-mono">
+                {trade.trade_number}
+              </h1>
+              <span className="text-xs text-muted-foreground font-mono">
+                {trade.corridor}
+              </span>
             </div>
-            <p className="text-sm text-muted-foreground">{trade.goods_description}</p>
+            <p className="text-sm text-muted-foreground">
+              {trade.goods_description}
+            </p>
           </div>
           <div className="text-right">
             <p className="text-xl font-mono font-bold text-gold">
@@ -466,7 +536,9 @@ export default function TradeDetailPage({
             <p className="text-[10px] text-muted-foreground uppercase tracking-wider mb-1">
               Status
             </p>
-            <p className={cn("text-sm font-medium", statusColor)}>{statusLabel}</p>
+            <p className={cn("text-sm font-medium", statusColor)}>
+              {statusLabel}
+            </p>
           </div>
           <div>
             <p className="text-[10px] text-muted-foreground uppercase tracking-wider mb-1">
@@ -486,7 +558,10 @@ export default function TradeDetailPage({
                 <CopyButton text={trade.buyer.wallet_address} />
               )}
               {isBuyer && (
-                <Badge variant="outline" className="text-[9px] text-gold border-gold/30 py-0 h-4">
+                <Badge
+                  variant="outline"
+                  className="text-[9px] text-gold border-gold/30 py-0 h-4"
+                >
                   You
                 </Badge>
               )}
@@ -498,16 +573,23 @@ export default function TradeDetailPage({
             </p>
             {trade.supplier ? (
               <div className="flex items-center gap-1.5">
-                <p className="text-sm font-mono">{shortAddress(trade.supplier.wallet_address)}</p>
+                <p className="text-sm font-mono">
+                  {shortAddress(trade.supplier.wallet_address)}
+                </p>
                 <CopyButton text={trade.supplier.wallet_address} />
                 {isSupplier && (
-                  <Badge variant="outline" className="text-[9px] text-gold border-gold/30 py-0 h-4">
+                  <Badge
+                    variant="outline"
+                    className="text-[9px] text-gold border-gold/30 py-0 h-4"
+                  >
                     You
                   </Badge>
                 )}
               </div>
             ) : (
-              <p className="text-sm text-muted-foreground italic">Awaiting supplier</p>
+              <p className="text-sm text-muted-foreground italic">
+                Awaiting supplier
+              </p>
             )}
           </div>
         </div>
@@ -535,29 +617,76 @@ export default function TradeDetailPage({
         )}
       </div>
 
+      {/* ── Trade timeline ─────────────────────────────────────────────── */}
       <div className="trade-card space-y-2">
         <p className="text-sm font-semibold">Trade Timeline</p>
         <div className="grid grid-cols-2 gap-2 text-xs">
-          <div className={cn("rounded-md border px-2 py-1", ["pending_supplier", "pending_funding", "funded", "in_progress", "milestone_1_released", "milestone_2_released", "completed", "disputed"].includes(trade.status) ? "border-gold/40 text-gold" : "border-border text-muted-foreground")}>
-            1. Intent Created
-          </div>
-          <div className={cn("rounded-md border px-2 py-1", ["pending_funding", "funded", "in_progress", "milestone_1_released", "milestone_2_released", "completed", "disputed"].includes(trade.status) ? "border-gold/40 text-gold" : "border-border text-muted-foreground")}>
-            2. Supplier Joined
-          </div>
-          <div className={cn("rounded-md border px-2 py-1", ["pending_funding"].includes(trade.status) ? "border-gold/40 text-gold" : "border-border text-muted-foreground")}>
-            3. Awaiting Funding
-          </div>
-          <div className={cn("rounded-md border px-2 py-1", ["funded", "in_progress", "milestone_1_released", "milestone_2_released", "completed", "disputed"].includes(trade.status) ? "border-gold/40 text-gold" : "border-border text-muted-foreground")}>
-            4. Escrow Funded
-          </div>
+          {(
+            [
+              {
+                label: "1. Intent Created",
+                active: [
+                  "pending_supplier",
+                  "pending_funding",
+                  "funded",
+                  "in_progress",
+                  "milestone_1_released",
+                  "milestone_2_released",
+                  "completed",
+                  "disputed",
+                ],
+              },
+              {
+                label: "2. Supplier Joined",
+                active: [
+                  "pending_funding",
+                  "funded",
+                  "in_progress",
+                  "milestone_1_released",
+                  "milestone_2_released",
+                  "completed",
+                  "disputed",
+                ],
+              },
+              {
+                label: "3. Awaiting Funding",
+                active: ["pending_funding"],
+              },
+              {
+                label: "4. Escrow Funded",
+                active: [
+                  "funded",
+                  "in_progress",
+                  "milestone_1_released",
+                  "milestone_2_released",
+                  "completed",
+                  "disputed",
+                ],
+              },
+            ] as const
+          ).map(({ label, active }) => (
+            <div
+              key={label}
+              className={cn(
+                "rounded-md border px-2 py-1",
+                (active as readonly string[]).includes(trade.status)
+                  ? "border-gold/40 text-gold"
+                  : "border-border text-muted-foreground"
+              )}
+            >
+              {label}
+            </div>
+          ))}
         </div>
       </div>
 
+      {/* ── Invite supplier ────────────────────────────────────────────── */}
       {isBuyer && trade.status === "pending_supplier" && (
         <div className="trade-card border-[hsl(var(--gold)/0.35)] bg-[hsl(var(--gold)/0.03)] space-y-3">
           <p className="text-sm font-semibold">Invite Supplier</p>
           <p className="text-xs text-muted-foreground">
-            Share this link with your supplier. The page auto-refreshes every 10s and will update when they join.
+            Share this link with your supplier. This page checks for their
+            response every 20 s and will update automatically when they join.
           </p>
           <div className="rounded-md border border-border bg-input/40 px-3 py-2 text-xs font-mono break-all">
             {inviteLink ?? "Invite link not available"}
@@ -586,16 +715,18 @@ export default function TradeDetailPage({
             )}
           </div>
           <p className="text-xs text-muted-foreground">
-            Supplier status: {trade.supplier ? "Joined" : "Not joined yet"}
+            Supplier status: {trade.supplier ? "Joined ✓" : "Not joined yet"}
           </p>
         </div>
       )}
 
+      {/* ── Supplier invitation (invite viewer) ────────────────────────── */}
       {isInviteViewer && trade.status === "pending_supplier" && (
         <div className="trade-card border-[hsl(var(--gold)/0.35)] bg-[hsl(var(--gold)/0.03)] space-y-3">
           <p className="text-sm font-semibold">Supplier Invitation</p>
           <p className="text-xs text-muted-foreground">
-            If this trade matches your agreement, accept to join as supplier. Buyer will fund escrow after you join.
+            If this trade matches your agreement, accept to join as supplier.
+            Buyer will fund escrow after you join.
           </p>
           <div className="flex gap-2">
             <Button
@@ -616,6 +747,7 @@ export default function TradeDetailPage({
         </div>
       )}
 
+      {/* ── Fund escrow CTA ────────────────────────────────────────────── */}
       {isBuyer && trade.status === "pending_funding" && (
         <div className="trade-card border-[hsl(var(--gold)/0.4)] bg-[hsl(var(--gold)/0.03)] space-y-3">
           <div className="flex items-center gap-2">
@@ -623,8 +755,8 @@ export default function TradeDetailPage({
             <p className="text-sm font-semibold">Fund the Escrow</p>
           </div>
           <p className="text-xs text-muted-foreground">
-            Connect your buyer wallet with enough devnet USDC, then lock
-            ${formatUsdc(Number(trade.total_amount_usdc))} USDC into escrow.
+            Connect your buyer wallet with enough devnet USDC, then lock $
+            {formatUsdc(Number(trade.total_amount_usdc))} USDC into escrow.
             Funds release by milestones.
           </p>
           <Button
@@ -633,11 +765,14 @@ export default function TradeDetailPage({
             className="gradient-gold text-black font-semibold hover:opacity-90 glow-gold"
           >
             <Lock className="w-4 h-4 mr-2" />
-            {actionLoading ? "Processing..." : `Lock $${formatUsdc(Number(trade.total_amount_usdc))} USDC`}
+            {actionLoading
+              ? "Processing..."
+              : `Lock $${formatUsdc(Number(trade.total_amount_usdc))} USDC`}
           </Button>
         </div>
       )}
 
+      {/* ── Milestones ─────────────────────────────────────────────────── */}
       <div className="trade-card space-y-2">
         <h2 className="text-sm font-semibold uppercase tracking-wider text-muted-foreground mb-4">
           Milestones
@@ -663,11 +798,15 @@ export default function TradeDetailPage({
         )}
       </div>
 
+      <WalletDebugPanel tradeId={tradeId} />
+
+      {/* ── Trade chat ─────────────────────────────────────────────────── */}
       <TradeChat
         tradeId={trade.id}
         isClosed={["completed", "cancelled", "refunded"].includes(trade.status)}
       />
 
+      {/* ── Dispute FAB ────────────────────────────────────────────────── */}
       {(isBuyer || isSupplier) &&
         !["completed", "cancelled", "refunded", "disputed"].includes(
           trade.status
