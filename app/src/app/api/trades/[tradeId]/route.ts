@@ -22,25 +22,72 @@ const privy = new PrivyClient({
   appSecret: process.env.PRIVY_APP_SECRET!,
 });
 
-type PrivyLinkedAccount = LinkedAccount & { chain_type?: string };
+type PrivyLinkedAccount = LinkedAccount & {
+  chain_type?: string;
+  address?: string;
+};
 
-/**
- * FIX: Replace `privy.users()._get()` (private API, causes 57s hangs)
- * with JWT claim extraction — wallet address is already in the token payload.
- */
-function extractWalletFromClaims(claims: Record<string, unknown>): string | null {
-  const linked = claims.linked_accounts as PrivyLinkedAccount[] | undefined;
-  if (!linked || !Array.isArray(linked)) return null;
-
-  const solana = linked.find(
-    (a) => a.type === "wallet" && (a as {chain_type?: string}).chain_type === "solana"
+function findSolanaWallet(linkedAccounts: LinkedAccount[]): string | null {
+  const accounts = linkedAccounts as PrivyLinkedAccount[];
+  const solana = accounts.find(
+    (a) => a.type === "wallet" && a.chain_type === "solana"
   );
-  if (solana && "address" in solana) return (solana as {address: string}).address;
+  return solana?.address ?? null;
+}
 
-  const anyWallet = linked.find((a) => a.type === "wallet");
-  if (anyWallet && "address" in anyWallet) return (anyWallet as {address: string}).address;
+async function resolveOptionalAuthWallet(token: string) {
+  const decoded = (() => {
+    try {
+      const parts = token.split(".");
+      if (parts.length < 2) return null;
+      const payloadPart = parts[1];
+      const normalized = payloadPart.replace(/-/g, "+").replace(/_/g, "/");
+      const padded = normalized.padEnd(
+        normalized.length + ((4 - (normalized.length % 4)) % 4),
+        "="
+      );
+      return JSON.parse(
+        Buffer.from(padded, "base64").toString("utf8")
+      ) as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+  })();
 
-  return null;
+  try {
+    const verifiedClaims = await privy
+      .utils()
+      .auth()
+      .verifyAccessToken(token);
+    const privyDid = verifiedClaims.user_id;
+    const privyUser = await privy.users().get(privyDid);
+    return {
+      privyDid,
+      walletAddress: findSolanaWallet(privyUser.linked_accounts ?? []),
+      verificationMethod: "verifyAccessToken" as const,
+    };
+  } catch {
+    const verifiedAuthClaims = await privy
+      .utils()
+      .auth()
+      .verifyAuthToken(token);
+    const privyDid =
+      verifiedAuthClaims.user_id ??
+      (typeof decoded?.sub === "string" ? decoded.sub : undefined);
+    if (!privyDid) {
+      return {
+        privyDid: undefined,
+        walletAddress: null,
+        verificationMethod: "verifyAuthToken" as const,
+      };
+    }
+    const privyUser = await privy.users().get(privyDid);
+    return {
+      privyDid,
+      walletAddress: findSolanaWallet(privyUser.linked_accounts ?? []),
+      verificationMethod: "verifyAuthToken" as const,
+    };
+  }
 }
 
 async function getOptionalAuthedUser(req: NextRequest) {
@@ -49,23 +96,30 @@ async function getOptionalAuthedUser(req: NextRequest) {
 
   try {
     const token = authHeader.replace("Bearer ", "");
-    // Local JWT verification — no Privy API call
-    const verifiedClaims = await privy
-      .utils()
-      .auth()
-      .verifyAccessToken(token);
+    const { privyDid, walletAddress, verificationMethod } =
+      await resolveOptionalAuthWallet(token);
 
-    // Extract wallet from JWT payload — eliminates the 57s _get() hang
-    const walletAddress = extractWalletFromClaims(
-      verifiedClaims as unknown as Record<string, unknown>
-    );
-    if (!walletAddress) return null;
+    if (!walletAddress) {
+      console.warn("[GET /api/trades/[tradeId]] optional auth missing wallet", {
+        path: req.nextUrl.pathname,
+        privyDid,
+      });
+      return null;
+    }
 
     const user = await prisma.user.upsert({
       where: { wallet_address: walletAddress },
       create: { wallet_address: walletAddress },
       update: {},
     });
+    if (process.env.NODE_ENV === "development") {
+      console.log("[GET /api/trades/[tradeId]] optional auth resolved", {
+        privyDid,
+        verificationMethod,
+        walletAddress,
+        userId: user.id,
+      });
+    }
     return user;
   } catch {
     return null;

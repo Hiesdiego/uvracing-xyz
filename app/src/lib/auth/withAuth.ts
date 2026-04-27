@@ -5,44 +5,84 @@ import type { User } from "@prisma/client";
 
 /**
  * One PrivyClient instance — creating it per-request is wasteful.
- * The JWT verification is local (no network); only upsert hits the DB.
  */
+const privyAppId = process.env.NEXT_PUBLIC_PRIVY_APP_ID?.trim();
+const privyAppSecret = process.env.PRIVY_APP_SECRET?.trim();
+
+if (!privyAppId || !privyAppSecret) {
+  throw new Error(
+    "Privy credentials are missing. Ensure NEXT_PUBLIC_PRIVY_APP_ID and PRIVY_APP_SECRET are set."
+  );
+}
+
 const privy = new PrivyClient({
-  appId: process.env.NEXT_PUBLIC_PRIVY_APP_ID!,
-  appSecret: process.env.PRIVY_APP_SECRET!,
+  appId: privyAppId,
+  appSecret: privyAppSecret,
 });
 
-// ---------------------------------------------------------------------------
-// extractWalletFromClaims
-//
-// FIX: The original code called `privy.users()._get(userId)` — a private,
-// undocumented method — to fetch the user's wallet address from Privy's API.
-// That HTTP call was timing out at ~57 seconds and causing:
-//   • P1017 "Server has closed the connection" (Prisma waited on a stale socket)
-//   • Random 401/403 responses (the _get call failed or timed out silently)
-//
-// The wallet address is already embedded in Privy's access token JWT.
-// `verifyAccessToken` decodes and verifies the JWT locally — no network call.
-// The returned claims object contains `linked_accounts` with all wallets.
-// We extract it there instead of making a second round-trip to Privy's API.
-// ---------------------------------------------------------------------------
-type PrivyLinkedAccount = LinkedAccount & { chain_type?: string };
+type PrivyLinkedAccount = LinkedAccount & {
+  chain_type?: string;
+  address?: string;
+};
 
-function extractWalletFromClaims(claims: Record<string, unknown>): string | null {
-  // Privy v3 access tokens embed linked_accounts in the JWT payload.
-  const linked = claims.linked_accounts as PrivyLinkedAccount[] | undefined;
-  if (!linked || !Array.isArray(linked)) return null;
+function decodeJwtPayload(token: string): Record<string, unknown> | null {
+  try {
+    const parts = token.split(".");
+    if (parts.length < 2) return null;
+    const payloadPart = parts[1];
+    const normalized = payloadPart.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized.padEnd(
+      normalized.length + ((4 - (normalized.length % 4)) % 4),
+      "="
+    );
+    const decoded = Buffer.from(padded, "base64").toString("utf8");
+    return JSON.parse(decoded) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
 
-  // Prefer the Solana wallet; fall back to any wallet account.
-  const solana = linked.find(
-    (a) => a.type === "wallet" && (a as {chain_type?: string}).chain_type === "solana"
+function findSolanaWallet(linkedAccounts: LinkedAccount[]): string | null {
+  const accounts = linkedAccounts as PrivyLinkedAccount[];
+  // Prefer Privy-embedded Solana wallet (walletClientType === "privy" on client)
+  const solana = accounts.find(
+    (a) => a.type === "wallet" && a.chain_type === "solana"
   );
-  if (solana && "address" in solana) return (solana as {address: string}).address;
+  return solana?.address ?? null;
+}
 
-  const anyWallet = linked.find((a) => a.type === "wallet");
-  if (anyWallet && "address" in anyWallet) return (anyWallet as {address: string}).address;
-
-  return null;
+async function resolvePrivyUserFromToken(token: string): Promise<{
+  privyDid: string;
+  linkedAccounts: LinkedAccount[];
+  verificationMethod: "verifyAccessToken" | "verifyAuthToken";
+}> {
+  const decoded = decodeJwtPayload(token);
+  try {
+    const verifiedClaims = await privy.utils().auth().verifyAccessToken(token);
+    const privyDid = verifiedClaims.user_id;
+    const privyUser = await privy.users().get(privyDid);
+    return {
+      privyDid,
+      linkedAccounts: privyUser.linked_accounts ?? [],
+      verificationMethod: "verifyAccessToken",
+    };
+  } catch (accessErr) {
+    try {
+      const verifiedAuthClaims = await privy.utils().auth().verifyAuthToken(token);
+      const privyDid =
+        verifiedAuthClaims.user_id ??
+        (typeof decoded?.sub === "string" ? decoded.sub : undefined);
+      if (!privyDid) throw accessErr;
+      const privyUser = await privy.users().get(privyDid);
+      return {
+        privyDid,
+        linkedAccounts: privyUser.linked_accounts ?? [],
+        verificationMethod: "verifyAuthToken",
+      };
+    } catch {
+      throw accessErr;
+    }
+  }
 }
 
 export type AuthedRequest = NextRequest & {
@@ -61,10 +101,10 @@ type RouteHandler<TParams extends RouteParams = Record<string, never>> = (
  * Wraps an API route handler with Privy auth verification.
  * Automatically upserts the user record on first visit.
  *
- * Auth flow (all local / DB — no external Privy API calls):
- *  1. Verify JWT signature locally via privy.utils().auth().verifyAccessToken()
- *  2. Extract wallet address from JWT claims (linked_accounts)
- *  3. Upsert user in our DB
+ * Auth flow:
+ *  1. Verify JWT signature locally (verifyAccessToken — no network call)
+ *  2. Fetch full Privy user via privy.users().get(userId) to get linked_accounts
+ *  3. Upsert DB user by wallet_address
  */
 export function withAuth<TParams extends RouteParams = Record<string, never>>(
   handler: RouteHandler<TParams>
@@ -73,40 +113,51 @@ export function withAuth<TParams extends RouteParams = Record<string, never>>(
     req: NextRequest,
     context: { params: Promise<TParams> }
   ) => {
+    let tokenForDebug: string | null = null;
     try {
       const authHeader = req.headers.get("authorization");
       if (!authHeader?.startsWith("Bearer ")) {
         return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
       }
 
-      const token = authHeader.replace("Bearer ", "");
+      const token = authHeader.slice("Bearer ".length).trim();
+      tokenForDebug = token;
 
-      // Step 1: verify JWT locally — fast, no network call
-      const verifiedClaims = await privy
-        .utils()
-        .auth()
-        .verifyAccessToken(token);
+      if (!token || token === "undefined" || token === "null") {
+        console.error("[withAuth] Invalid bearer token value", {
+          path: req.nextUrl.pathname,
+          tokenPreview: token,
+        });
+        return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+      }
 
-      // Step 2: extract wallet from JWT payload — no Privy API call needed
-      const walletAddress = extractWalletFromClaims(
-        verifiedClaims as unknown as Record<string, unknown>
-      );
+      // Step 1/2: verify token and resolve linked accounts
+      const { privyDid, linkedAccounts, verificationMethod } =
+        await resolvePrivyUserFromToken(token);
+      const walletAddress = findSolanaWallet(linkedAccounts);
 
       if (!walletAddress) {
-        console.warn(
-          "[withAuth] No wallet address found in JWT claims for user:",
-          verifiedClaims.userId ?? verifiedClaims.user_id
-        );
+        console.warn("[withAuth] WALLET_NOT_READY", {
+          path: req.nextUrl.pathname,
+          privyDid,
+        });
         return NextResponse.json(
-          { error: "No wallet address found in token" },
-          { status: 400 }
+          {
+            error: "No Solana wallet found for this account yet.",
+            code: "WALLET_NOT_READY",
+            detail:
+              "Please create your embedded Solana wallet and retry this action.",
+          },
+          { status: 403 }
         );
       }
 
-      // Step 3: upsert user in our DB
+      // Step 3: upsert by wallet address
       const user = await prisma.user.upsert({
         where: { wallet_address: walletAddress },
-        create: { wallet_address: walletAddress },
+        create: {
+          wallet_address: walletAddress,
+        },
         update: {},
       });
 
@@ -114,9 +165,40 @@ export function withAuth<TParams extends RouteParams = Record<string, never>>(
       authedReq.user = user;
       authedReq.walletAddress = walletAddress;
 
+      if (process.env.NODE_ENV === "development") {
+        console.log("[withAuth] authenticated", {
+          path: req.nextUrl.pathname,
+          privyDid,
+          verificationMethod,
+          walletAddress,
+          userId: user.id,
+        });
+      }
+
       return handler(authedReq, { params: await context.params });
     } catch (err) {
-      console.error("[withAuth] Error:", err);
+      const payload = tokenForDebug ? decodeJwtPayload(tokenForDebug) : null;
+      console.error("[withAuth] Error:", {
+        path: req.nextUrl.pathname,
+        message: err instanceof Error ? err.message : String(err),
+        privyConfiguredAppId: privyAppId,
+        tokenMeta: tokenForDebug
+          ? {
+              length: tokenForDebug.length,
+              parts: tokenForDebug.split(".").length,
+            }
+          : null,
+        decodedClaims: payload
+          ? {
+              iss: payload.iss,
+              aud: payload.aud,
+              sub: payload.sub,
+              user_id: payload.user_id,
+              exp: payload.exp,
+              iat: payload.iat,
+            }
+          : null,
+      });
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
   };

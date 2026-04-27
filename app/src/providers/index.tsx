@@ -2,10 +2,12 @@
 
 import { PrivyProvider } from "./PrivyProvider";
 import { Toaster } from "react-hot-toast";
+import { EnsureEmbeddedSolanaWallet } from "@/components/auth/EnsureEmbeddedSolanaWallet";
 
 export function Providers({ children }: { children: React.ReactNode }) {
   return (
     <PrivyProvider>
+      <EnsureEmbeddedSolanaWallet />
       {children}
       <Toaster
         position="bottom-right"

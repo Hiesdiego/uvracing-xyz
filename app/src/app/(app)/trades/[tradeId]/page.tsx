@@ -18,6 +18,7 @@ import {
   Check,
 } from "lucide-react";
 import { usePrivy } from "@privy-io/react-auth";
+import { useWallets } from "@privy-io/react-auth/solana";
 import toast from "react-hot-toast";
 import { useTradeDetail, useTradeActions } from "@/hooks/useTrade";
 import { useEscrow } from "@/hooks/useEscrow";
@@ -283,6 +284,7 @@ export default function TradeDetailPage({
   const createdFromIntent = searchParams.get("created") === "1";
 
   const { user } = usePrivy();
+  const { wallets } = useWallets();
   const { trade, loading, error, refetch } = useTradeDetail(
     tradeId,
     inviteToken
@@ -302,9 +304,35 @@ export default function TradeDetailPage({
     loading: chainLoading,
   } = useEscrow();
 
-  const walletAddress =
-    user?.wallet?.address ??
-    user?.linkedAccounts?.find((a) => a.type === "wallet")?.address;
+  const walletAddress = useMemo(() => {
+    const allWallets = wallets as Array<{
+      address?: string;
+      walletClientType?: string;
+    }>;
+    const embedded = allWallets.find(
+      (w) => w.walletClientType === "privy" && !!w.address
+    );
+    const fallback = allWallets.find((w) => !!w.address);
+
+    return (
+      embedded?.address ??
+      fallback?.address ??
+      user?.wallet?.address ??
+      user?.linkedAccounts?.find((a) => a.type === "wallet")?.address ??
+      null
+    );
+  }, [wallets, user]);
+
+  useEffect(() => {
+    if (process.env.NODE_ENV !== "development") return;
+    console.log("[TradeDetailPage] wallet identity resolution", {
+      tradeId,
+      resolvedWalletAddress: walletAddress,
+      wallets: (wallets as Array<{ address?: string; walletClientType?: string }>).map(
+        (w) => ({ address: w.address, type: w.walletClientType })
+      ),
+    });
+  }, [tradeId, walletAddress, wallets]);
 
   const isBuyer = trade?.buyer?.wallet_address === walletAddress;
   const isSupplier = trade?.supplier?.wallet_address === walletAddress;

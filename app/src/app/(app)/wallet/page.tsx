@@ -1,7 +1,9 @@
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
-import { usePrivy, useWallets } from "@privy-io/react-auth";
+import { useMemo } from "react";
+import { usePrivy } from "@privy-io/react-auth";
+import { useWallets } from "@privy-io/react-auth/solana";
 import {
   Wallet,
   Copy,
@@ -227,7 +229,17 @@ export default function WalletPage() {
   const { getAccessToken } = usePrivy();
   const { wallets } = useWallets();
 
-  const walletAddress = wallets[0]?.address ?? null;
+  const walletAddress = useMemo(() => {
+    const allWallets = wallets as Array<{
+      address?: string;
+      walletClientType?: string;
+    }>;
+    const embedded = allWallets.find(
+      (w) => w.walletClientType === "privy" && !!w.address
+    );
+    const fallback = allWallets.find((w) => !!w.address);
+    return embedded?.address ?? fallback?.address ?? null;
+  }, [wallets]);
 
   const [balance, setBalance] = useState<number | null>(null);
   const [balanceLoading, setBalanceLoading] = useState(true);
@@ -275,6 +287,16 @@ export default function WalletPage() {
     fetchBalance();
     fetchEvents();
   }, [fetchBalance, fetchEvents]);
+
+  useEffect(() => {
+    if (process.env.NODE_ENV !== "development") return;
+    console.log("[WalletPage] wallet resolution", {
+      resolvedWalletAddress: walletAddress,
+      wallets: (wallets as Array<{ address?: string; walletClientType?: string }>).map(
+        (w) => ({ address: w.address, type: w.walletClientType })
+      ),
+    });
+  }, [walletAddress, wallets]);
 
   return (
     <div className="max-w-2xl space-y-8 animate-fade-in">
