@@ -10,6 +10,7 @@ import {
   validationErrorResponse,
 } from "@/lib/api/validation";
 import { assertChainBackedTx } from "@/lib/solana/verify";
+import { appendLedgerEntry, computeReceiptHash } from "@/lib/ledger";
 
 type Context = { params: { disputeId: string } };
 
@@ -124,6 +125,59 @@ export const POST = withAuth(async (req: AuthedRequest, ctx: Context) => {
       resolution as "buyer" | "supplier" | "split",
       arbiter_notes
     ).catch(console.error);
+
+    await appendLedgerEntry({
+      tradeId: trade.id,
+      actorUserId: req.user.id,
+      eventType: "dispute_resolved",
+      referenceTx: tx_signature,
+      metadata: {
+        dispute_id: disputeId,
+        resolution,
+        arbiter_notes: arbiter_notes ?? null,
+      },
+    });
+
+    const ledgerRows = await prisma.ledgerEntry.findMany({
+      where: { trade_id: trade.id },
+      orderBy: { created_at: "asc" },
+    });
+    const receiptPayload = {
+      trade_id: trade.id,
+      trade_number: trade.trade_number,
+      resolution,
+      tx_signature,
+      generated_at: new Date().toISOString(),
+      ledger_entries: ledgerRows.map((r) => ({
+        id: r.id,
+        event_type: r.event_type,
+        amount_usdc: r.amount_usdc,
+        reference_tx: r.reference_tx,
+        entry_hash: r.entry_hash,
+        previous_hash: r.previous_hash,
+        created_at: r.created_at,
+      })),
+    };
+    const latestHash = computeReceiptHash(receiptPayload);
+    const previousReceipt = await prisma.tradeReceipt.findUnique({
+      where: { trade_id: trade.id },
+    });
+    await prisma.tradeReceipt.upsert({
+      where: { trade_id: trade.id },
+      create: {
+        trade_id: trade.id,
+        tx_signature,
+        receipt_hash: latestHash,
+        previous_receipt_hash: previousReceipt?.receipt_hash ?? null,
+        receipt_payload: receiptPayload,
+      },
+      update: {
+        tx_signature,
+        receipt_hash: latestHash,
+        previous_receipt_hash: previousReceipt?.receipt_hash ?? null,
+        receipt_payload: receiptPayload,
+      },
+    });
 
     return NextResponse.json({ success: true, resolution });
   } catch (error) {

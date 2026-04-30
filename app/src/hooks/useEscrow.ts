@@ -3,7 +3,7 @@
 import { useState, useEffect, useRef } from "react";
 import { usePrivy } from "@privy-io/react-auth";
 import { useWallets } from "@privy-io/react-auth/solana";
-import { PublicKey } from "@solana/web3.js";
+import { LAMPORTS_PER_SOL, PublicKey } from "@solana/web3.js";
 import toast from "react-hot-toast";
 import {
   initializeEscrow,
@@ -14,43 +14,116 @@ import {
   fetchEscrowAccount,
 } from "@/lib/solana/escrow";
 import { deriveEscrowPda, getConnection } from "@/lib/solana/program";
-import { DEFAULT_MILESTONE_BPS } from "@/lib/constants";
+import { DEFAULT_MILESTONE_BPS, RPC_URL } from "@/lib/constants";
+import { anchorProofHashOnChain } from "@/lib/solana/witness";
 import type { Trade } from "@/types";
+
+const MIN_SOL_FOR_ESCROW_TXS = 0.001;
 
 // ---------------------------------------------------------------------------
 // PrivyWallet type helper
-// walletClientType is present on Privy wallet objects but not in the public
-// type definition, so we extend it.
 // ---------------------------------------------------------------------------
 type PrivyWalletExtra = {
   address: string;
   walletClientType?: string;
   connectorType?: string;
+  meta?: { id?: string; name?: string };
+  isConnected?: () => Promise<boolean>;
+  features?: Record<string, unknown>;
+  standardWallet?: {
+    name?: string;
+    isPrivyWallet?: boolean;
+  };
   signTransaction: (tx: unknown) => Promise<unknown>;
+  sendTransaction?: (tx: unknown) => Promise<unknown>;
 };
+
+async function ensureWalletConnected(wallet: PrivyWalletExtra) {
+  try {
+    const connected = await wallet.isConnected?.();
+    if (connected) return;
+
+    const connectFeature = (
+      wallet.features?.["standard:connect"] as
+        | { connect?: () => Promise<unknown> }
+        | undefined
+    )?.connect;
+
+    if (connectFeature) {
+      await connectFeature();
+    }
+  } catch (err) {
+    console.warn("[useEscrow] wallet connect preflight failed", {
+      message: err instanceof Error ? err.message : String(err),
+      walletClientType: wallet.walletClientType,
+      connectorType: wallet.connectorType,
+      metaId: wallet.meta?.id,
+      metaName: wallet.meta?.name,
+    });
+  }
+}
+function toNativeUint8Array(input: unknown): Uint8Array | null {
+  if (input instanceof Uint8Array) {
+    return new Uint8Array(input);
+  }
+  if (ArrayBuffer.isView(input)) {
+    const view = input as ArrayBufferView;
+    return new Uint8Array(view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength));
+  }
+  if (input instanceof ArrayBuffer) {
+    return new Uint8Array(input);
+  }
+  return null;
+}
+
+function extractSignatureFromSendResult(result: unknown): string | null {
+  if (typeof result === "string") return result;
+  if (!result || typeof result !== "object") return null;
+  if ("signature" in result && typeof (result as { signature?: unknown }).signature === "string") {
+    return (result as { signature: string }).signature;
+  }
+  if ("signatures" in result) {
+    const signatures = (result as { signatures?: unknown }).signatures;
+    if (Array.isArray(signatures) && typeof signatures[0] === "string") {
+      return signatures[0];
+    }
+  }
+  return null;
+}
+
+function trySerializeTransaction(input: unknown): Uint8Array | null {
+  if (!input || typeof input !== "object") return null;
+  const serialize = (input as { serialize?: (...args: unknown[]) => unknown }).serialize;
+  if (typeof serialize !== "function") return null;
+
+  try {
+    const maybeLegacy = serialize.call(input, {
+      requireAllSignatures: false,
+      verifySignatures: false,
+    });
+    const nativeLegacy = toNativeUint8Array(maybeLegacy);
+    if (nativeLegacy) return nativeLegacy;
+  } catch {
+    // fall through to no-arg serialize path
+  }
+
+  try {
+    const maybeVersioned = serialize.call(input);
+    return toNativeUint8Array(maybeVersioned);
+  } catch {
+    return null;
+  }
+}
+
+function inferSolanaChainFromRpc(): "solana:mainnet" | "solana:devnet" | "solana:testnet" {
+  const rpc = RPC_URL.toLowerCase();
+  if (rpc.includes("devnet")) return "solana:devnet";
+  if (rpc.includes("testnet")) return "solana:testnet";
+  return "solana:mainnet";
+}
 
 // ---------------------------------------------------------------------------
 // useEmbeddedWallet
-//
-// THE FIX for "wallet never loads":
-//
-// The old code used `wallets[0]` from useWallets(). This is wrong for two
-// reasons:
-//
-// 1. When shouldAutoConnect was true (old PrivyProvider), any previously-
-//    connected external wallet (Phantom, Backpack…) auto-reconnected on page
-//    load and landed at wallets[0], displacing the embedded wallet. The buyer
-//    then signed with Phantom — which holds no USDC — and the tx failed
-//    silently.
-//
-// 2. Even with shouldAutoConnect: false (our PrivyProvider fix), wallet order
-//    in the array is not guaranteed to put the embedded wallet first.
-//
-// The fix: ALWAYS explicitly find the wallet whose walletClientType === "privy"
-// (that's the embedded wallet). Only fall back to wallets[0] if no embedded
-// wallet exists (i.e. user connected an external wallet for login).
-//
-// We also poll until ready so callers don't need to handle the async delay.
 // ---------------------------------------------------------------------------
 function useEmbeddedWallet() {
   const { ready } = usePrivy();
@@ -69,6 +142,7 @@ function useEmbeddedWallet() {
     function resolve() {
       const allWallets = wallets as unknown as PrivyWalletExtra[];
 
+      // Always log wallet info in dev to help diagnose future issues
       if (process.env.NODE_ENV === "development") {
         console.group("[useEmbeddedWallet] wallet resolution");
         console.log(
@@ -77,12 +151,22 @@ function useEmbeddedWallet() {
             address: w.address,
             type: w.walletClientType,
             connector: w.connectorType,
+            standardWalletName: w.standardWallet?.name,
+            isPrivyStandard: w.standardWallet?.isPrivyWallet,
+            // Log ALL keys to help identify the correct property names
+            keys: Object.keys(w),
           }))
         );
+        console.groupEnd();
       }
 
       // Prefer the Privy embedded wallet
-      const embedded = allWallets.find((w) => w.walletClientType === "privy");
+      const embedded = allWallets.find(
+        (w) =>
+          w.walletClientType === "privy" ||
+          w.standardWallet?.isPrivyWallet === true ||
+          w.standardWallet?.name === "Privy"
+      );
 
       // Fallback: any wallet with an address (external sign-in wallet)
       const fallback = allWallets.find((w) => w.address);
@@ -90,8 +174,10 @@ function useEmbeddedWallet() {
       const chosen = embedded ?? fallback ?? null;
 
       if (process.env.NODE_ENV === "development") {
-        console.log("chosen:", chosen ? { address: chosen.address, type: chosen.walletClientType } : null);
-        console.groupEnd();
+        console.log("[useEmbeddedWallet] chosen:", chosen
+          ? { address: chosen.address, type: chosen.walletClientType, connector: chosen.connectorType }
+          : null
+        );
       }
 
       if (chosen?.address) {
@@ -109,7 +195,6 @@ function useEmbeddedWallet() {
 
     resolve();
 
-    // If no wallet found yet (still provisioning), poll every 500ms for up to 10s
     if (!resolvedWallet) {
       pollRef.current = setInterval(resolve, 500);
       const timeout = setTimeout(() => {
@@ -133,15 +218,193 @@ function useEmbeddedWallet() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ready, wallets]);
 
-  const signingWallet = resolvedWallet
-    ? {
-        publicKey: new PublicKey(resolvedWallet.address),
-        signTransaction: async (tx: unknown) =>
-          resolvedWallet.signTransaction(tx),
-        signAllTransactions: async (txs: unknown[]) =>
-          Promise.all(txs.map((tx) => resolvedWallet.signTransaction(tx))),
+  let signingWallet: {
+    publicKey: PublicKey;
+    signTransaction: (tx: unknown) => Promise<unknown>;
+    sendTransaction?: (tx: unknown) => Promise<unknown>;
+    signAllTransactions: (txs: unknown[]) => Promise<unknown[]>;
+  } | null = null;
+
+  if (resolvedWallet) {
+    const chain = inferSolanaChainFromRpc();
+
+    const signOne = async (tx: unknown): Promise<unknown> => {
+      await ensureWalletConnected(resolvedWallet);
+
+      const nativeBytes = toNativeUint8Array(tx) ?? trySerializeTransaction(tx);
+      const walletId =
+        resolvedWallet.walletClientType ??
+        resolvedWallet.connectorType ??
+        resolvedWallet.meta?.name ??
+        resolvedWallet.address.slice(0, 8);
+
+      if (process.env.NODE_ENV === "development") {
+        console.log("[useEscrow] signTransaction input", {
+          type: Object.prototype.toString.call(tx),
+          hasNativeBytes: !!nativeBytes,
+          byteLength: nativeBytes?.byteLength ?? null,
+          walletId,
+          chain,
+        });
       }
-    : null;
+
+      const attempts: Array<{ label: string; exec: () => Promise<unknown> }> = [];
+
+      if (nativeBytes) {
+        attempts.push({
+          label: "bytes",
+          exec: () => resolvedWallet.signTransaction(nativeBytes),
+        });
+        attempts.push({
+          label: "args(transaction,wallet,chain,address)",
+          exec: () =>
+            resolvedWallet.signTransaction({
+              transaction: nativeBytes,
+              wallet: resolvedWallet,
+              address: resolvedWallet.address,
+              chain,
+            }),
+        });
+        attempts.push({
+          label: "args(transaction,address,chain)",
+          exec: () =>
+            resolvedWallet.signTransaction({
+              transaction: nativeBytes,
+              address: resolvedWallet.address,
+              chain,
+            }),
+        });
+        attempts.push({
+          label: "args(transaction,chain)",
+          exec: () =>
+            resolvedWallet.signTransaction({
+              transaction: nativeBytes,
+              chain,
+            }),
+        });
+
+        const signFeature = (
+          resolvedWallet.features?.["solana:signTransaction"] as
+            | {
+                signTransaction?: (...inputs: unknown[]) => Promise<unknown>;
+              }
+            | undefined
+        )?.signTransaction;
+
+        if (signFeature) {
+          attempts.push({
+            label: "feature(solana:signTransaction)",
+            exec: async () => {
+              const account =
+                (resolvedWallet as { accounts?: unknown[] }).accounts?.[0] ??
+                undefined;
+              const featureResult = await signFeature({
+                account,
+                chain,
+                transaction: nativeBytes,
+              });
+              return Array.isArray(featureResult) ? featureResult[0] : featureResult;
+            },
+          });
+        }
+      }
+
+      attempts.push({
+        label: "raw",
+        exec: () => resolvedWallet.signTransaction(tx),
+      });
+
+      const errors: string[] = [];
+      for (const attempt of attempts) {
+        try {
+          const result = await attempt.exec();
+          if (
+            result &&
+            typeof result === "object" &&
+            "signedTransaction" in (result as object)
+          ) {
+            return (result as { signedTransaction: unknown }).signedTransaction;
+          }
+          return result;
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          errors.push(`${attempt.label}: ${message}`);
+        }
+      }
+
+      console.error("[useEscrow] resolvedWallet.signTransaction threw:", {
+        walletId,
+        inputType: Object.prototype.toString.call(tx),
+        attempts: errors,
+      });
+
+      throw new Error(`Wallet signing failed (${walletId}): ${errors.join(" | ")}`);
+    };
+
+    signingWallet = {
+      publicKey: new PublicKey(resolvedWallet.address),
+      signTransaction: signOne,
+      sendTransaction: async (tx: unknown) => {
+        await ensureWalletConnected(resolvedWallet);
+        const nativeBytes = toNativeUint8Array(tx) ?? trySerializeTransaction(tx);
+        const account =
+          (resolvedWallet as { accounts?: unknown[] }).accounts?.[0] ?? undefined;
+        const signAndSendFeature = (
+          resolvedWallet.features?.["solana:signAndSendTransaction"] as
+            | {
+                signAndSendTransaction?: (...inputs: unknown[]) => Promise<unknown>;
+              }
+            | undefined
+        )?.signAndSendTransaction;
+
+        const attempts: Array<{ label: string; exec: () => Promise<unknown> }> = [];
+        if (resolvedWallet.sendTransaction) {
+          attempts.push({
+            label: "wallet.sendTransaction(raw)",
+            exec: () => resolvedWallet.sendTransaction!(tx),
+          });
+          if (nativeBytes) {
+            attempts.push({
+              label: "wallet.sendTransaction(args)",
+              exec: () =>
+                resolvedWallet.sendTransaction!({
+                  transaction: nativeBytes,
+                  address: resolvedWallet.address,
+                  chain,
+                }),
+            });
+          }
+        }
+        if (signAndSendFeature && nativeBytes) {
+          attempts.push({
+            label: "feature(solana:signAndSendTransaction)",
+            exec: () =>
+              signAndSendFeature({
+                account,
+                chain,
+                transaction: nativeBytes,
+              }),
+          });
+        }
+
+        const errors: string[] = [];
+        for (const attempt of attempts) {
+          try {
+            const result = await attempt.exec();
+            const sig = extractSignatureFromSendResult(result);
+            if (sig) return sig;
+            errors.push(`${attempt.label}: missing signature in response`);
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            errors.push(`${attempt.label}: ${message}`);
+          }
+        }
+
+        throw new Error(`Wallet sendTransaction failed: ${errors.join(" | ")}`);
+      },
+      signAllTransactions: async (txs: unknown[]) => Promise.all(txs.map((tx) => signOne(tx))),
+    };
+  }
 
   return { signingWallet, walletReady, walletAddress: resolvedWallet?.address ?? null };
 }
@@ -157,7 +420,6 @@ function buildMilestoneBps(milestones: Trade["milestones"]): number[] {
 
   const bps = milestones.map((m) => {
     const pct = Number(m.release_percentage);
-    // Detect decimal format (0 < x ≤ 1) vs integer percentage (e.g. 30)
     return pct > 0 && pct <= 1
       ? Math.round(pct * 10_000)
       : Math.round(pct * 100);
@@ -201,7 +463,6 @@ export function useEscrow() {
     if (!trade.supplier?.wallet_address)
       throw new Error("Supplier wallet not found on trade");
 
-    // Validate BPS before any chain interaction
     const milestoneBps = buildMilestoneBps(trade.milestones);
 
     console.log("[useEscrow] handleFundEscrow start", {
@@ -219,10 +480,19 @@ export function useEscrow() {
       const connection = getConnection();
       const [escrowPda] = deriveEscrowPda(trade.id);
       const escrowPubkey = escrowPda.toBase58();
+      const buyerLamports = await connection.getBalance(signingWallet.publicKey);
+      const buyerSol = buyerLamports / LAMPORTS_PER_SOL;
+
+      if (buyerSol < MIN_SOL_FOR_ESCROW_TXS) {
+        throw new Error(
+          `Insufficient SOL for network fees. ` +
+            `Need at least ${MIN_SOL_FOR_ESCROW_TXS} SOL, found ${buyerSol.toFixed(6)} SOL. ` +
+            `Request devnet SOL from faucet, then retry.`
+        );
+      }
 
       console.log("[useEscrow] escrow PDA:", escrowPubkey);
 
-      // Idempotency: skip initializeEscrow if account already exists
       const existingAccount = await connection.getAccountInfo(escrowPda);
       console.log("[useEscrow] escrow exists on-chain:", !!existingAccount);
 
@@ -356,6 +626,22 @@ export function useEscrow() {
     }
   }
 
+  async function anchorProofAttestation(
+    tradeId: string,
+    milestoneNumber: number,
+    proofHashSha256: string
+  ): Promise<string> {
+    if (!walletReady || !signingWallet) {
+      throw new Error("No Solana wallet connected");
+    }
+    return anchorProofHashOnChain({
+      wallet: signingWallet,
+      tradeId,
+      milestoneNumber,
+      proofHashSha256,
+    });
+  }
+
   return {
     loading,
     walletReady,
@@ -364,6 +650,7 @@ export function useEscrow() {
     handleReleaseMilestone,
     handleRaiseDispute,
     handleRefund,
+    anchorProofAttestation,
     fetchEscrowAccount,
   };
 }

@@ -10,7 +10,7 @@ pub mod state;
 
 pub use instructions::*;
 
-declare_id!("4awST95G8Lz67utWABJk5XmDwyrqnJbhjy7A85peJ2J2");
+declare_id!("AJxre8cru2aZNHynSBtFSUSfioCVFHHNiSoPedq8nYP9");
 
 #[program]
 pub mod tradeos {

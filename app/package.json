@@ -12,8 +12,8 @@
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.32.1",
-    "@prisma/adapter-pg": "7.7.0",
-    "@prisma/client": "^7.7.0",
+    "@prisma/adapter-pg": "7.8.0",
+    "@prisma/client": "^7.8.0",
     "@privy-io/node": "^0.12.0",
     "@privy-io/react-auth": "^3.19.0",
     "@solana-program/memo": "^0.11.0",
@@ -25,11 +25,11 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "grammy": "^1.42.0",
+    "jose": "^6.2.3",
     "lucide-react": "^1.7.0",
     "next": "16.2.2",
     "next-themes": "^0.4.6",
     "pg": "^8.20.0",
-    "prisma": "^7.7.0",
     "react": "19.2.4",
     "react-dom": "19.2.4",
     "react-hot-toast": "^2.6.0",
@@ -49,6 +49,7 @@
     "dotenv": "^17.4.1",
     "eslint": "^9",
     "eslint-config-next": "16.2.2",
+    "prisma": "^7.8.0",
     "tailwindcss": "^4",
     "typescript": "^5"
   }

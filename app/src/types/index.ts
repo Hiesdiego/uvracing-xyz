@@ -1,3 +1,5 @@
+//app/src/types/index.ts
+
 export type TradeStatus =
   | "pending_supplier"
   | "pending_funding"
@@ -76,6 +78,11 @@ export interface Milestone {
   release_amount_usdc: number | null;
   status: MilestoneStatus;
   proof_url: string | null;
+  proof_hash_sha256: string | null;
+  proof_anchor_tx: string | null;
+  proof_rejection_reason: string | null;
+  proof_rejected_at: string | null;
+  proof_version: number;
   proof_uploaded_at: string | null;
   released_at: string | null;
   tx_signature: string | null;

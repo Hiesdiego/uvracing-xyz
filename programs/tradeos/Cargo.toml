@@ -16,6 +16,9 @@ cpi = ["no-entrypoint"]
 default = []
 idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
 
+[profile.release]
+overflow-checks = true
+
 [dependencies]
 anchor-lang = { version = "1.0.0", features = ["init-if-needed"] }
 anchor-spl = "1.0.0"

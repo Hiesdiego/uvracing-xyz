@@ -1,7 +1,12 @@
+//app/src/lib/constants.ts
+
 export const PROGRAM_ID = process.env.NEXT_PUBLIC_PROGRAM_ID!;
 export const USDC_MINT = process.env.NEXT_PUBLIC_USDC_MINT!;
 export const SOLANA_NETWORK = process.env.NEXT_PUBLIC_SOLANA_NETWORK as "devnet" | "mainnet-beta";
 export const RPC_URL = process.env.NEXT_PUBLIC_SOLANA_RPC_URL!;
+export const RPC_WS_URL =
+  process.env.NEXT_PUBLIC_SOLANA_RPC_WS_URL ??
+  RPC_URL.replace(/^http/i, "ws");
 export const ARBITER_WALLET = process.env.NEXT_PUBLIC_ARBITER_WALLET!;
 export const APP_URL = process.env.NEXT_PUBLIC_APP_URL!;
 

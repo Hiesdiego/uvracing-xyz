@@ -1,5 +1,5 @@
 {
-  "address": "4awST95G8Lz67utWABJk5XmDwyrqnJbhjy7A85peJ2J2",
+  "address": "AJxre8cru2aZNHynSBtFSUSfioCVFHHNiSoPedq8nYP9",
   "metadata": {
     "name": "tradeos",
     "version": "0.1.0",
@@ -460,7 +460,7 @@
       ],
       "accounts": [
         {
-          "name": "arbiter",
+          "name": "buyer",
           "writable": true,
           "signer": true,
           "relations": [
@@ -755,31 +755,36 @@
     },
     {
       "code": 6008,
+      "name": "UnauthorizedBuyerRelease",
+      "msg": "Only the buyer can release milestones"
+    },
+    {
+      "code": 6009,
       "name": "UnauthorizedDispute",
       "msg": "Only the buyer or supplier can raise a dispute"
     },
     {
-      "code": 6009,
+      "code": 6010,
       "name": "UnauthorizedRefund",
       "msg": "Only the buyer can request a refund"
     },
     {
-      "code": 6010,
+      "code": 6011,
       "name": "RefundNotAllowed",
       "msg": "Cannot refund after a milestone has been released"
     },
     {
-      "code": 6011,
+      "code": 6012,
       "name": "EscrowDisputed",
       "msg": "Escrow is currently in disputed state"
     },
     {
-      "code": 6012,
+      "code": 6013,
       "name": "ArithmeticOverflow",
       "msg": "Arithmetic overflow"
     },
     {
-      "code": 6013,
+      "code": 6014,
       "name": "InvalidReleaseBps",
       "msg": "Release basis points cannot exceed 10000"
     }

@@ -74,13 +74,13 @@ pub fn handler(ctx: Context<ReleaseMilestone>, milestone_index: u8) -> Result<()
 #[instruction(milestone_index: u8)]
 pub struct ReleaseMilestone<'info> {
     #[account(mut)]
-    pub arbiter: Signer<'info>,
+    pub buyer: Signer<'info>,
 
     #[account(
         mut,
         seeds = [b"escrow", escrow.trade_id.as_bytes()],
         bump = escrow.bump,
-        has_one = arbiter @ TradeOSError::UnauthorizedArbiter,
+        has_one = buyer @ TradeOSError::UnauthorizedBuyerRelease,
     )]
     pub escrow: Account<'info, TradeEscrow>,
 

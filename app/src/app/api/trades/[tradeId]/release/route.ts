@@ -8,6 +8,7 @@ import {
   validationErrorResponse,
 } from "@/lib/api/validation";
 import { assertChainBackedTx } from "@/lib/solana/verify";
+import { appendLedgerEntry } from "@/lib/ledger";
 
 type Context = { params: { tradeId: string } };
 
@@ -38,11 +39,10 @@ export const POST = withAuth(async (req: AuthedRequest, ctx: Context) => {
       return NextResponse.json({ error: "Trade not found" }, { status: 404 });
     }
 
-    // Only buyer or arbiter wallet can confirm releases
-    const isArbiter = req.walletAddress === process.env.NEXT_PUBLIC_ARBITER_WALLET;
+    // Only buyer can confirm releases (contract authorization model)
     const isBuyer = trade.buyer_id === req.user.id;
 
-    if (!isBuyer && !isArbiter) {
+    if (!isBuyer) {
       return NextResponse.json({ error: "Forbidden" }, { status: 403 });
     }
 
@@ -97,6 +97,20 @@ export const POST = withAuth(async (req: AuthedRequest, ctx: Context) => {
         buyer: true,
         supplier: true,
         milestones: { orderBy: { milestone_number: "asc" } },
+      },
+    });
+
+    const releasedAmount =
+      (Number(trade.total_amount_usdc) * milestone.release_percentage) / 100;
+    await appendLedgerEntry({
+      tradeId,
+      actorUserId: req.user.id,
+      eventType: "milestone_released",
+      amountUsdc: releasedAmount,
+      referenceTx: tx_signature,
+      metadata: {
+        milestone_number,
+        release_percentage: milestone.release_percentage,
       },
     });
 

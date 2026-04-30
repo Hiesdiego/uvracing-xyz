@@ -40,6 +40,16 @@ enum UserRole {
   both
 }
 
+enum LedgerEventType {
+  escrow_funded
+  proof_uploaded
+  proof_rejected
+  milestone_released
+  dispute_opened
+  dispute_resolved
+  escrow_refunded
+}
+
 model User {
   id                String   @id @default(uuid())
   wallet_address    String   @unique
@@ -113,6 +123,11 @@ model Milestone {
   release_amount_usdc Decimal?
   status              MilestoneStatus @default(pending)
   proof_url           String?
+  proof_hash_sha256   String?
+  proof_anchor_tx     String?
+  proof_rejection_reason String?
+  proof_rejected_at   DateTime?
+  proof_version       Int             @default(0)
   proof_uploaded_at   DateTime?
   released_at         DateTime?
   tx_signature        String?
@@ -160,12 +175,34 @@ model TradeReceipt {
   id           String   @id @default(uuid())
   trade_id     String   @unique
   receipt_hash String?
+  previous_receipt_hash String?
+  receipt_payload Json?
+  compliance_version String? @default("v1")
   tx_signature String?
   issued_at    DateTime @default(now())
 
   trade Trade @relation(fields: [trade_id], references: [id])
 
   @@map("trade_receipts")
+}
+
+model LedgerEntry {
+  id               String          @id @default(uuid())
+  trade_id         String
+  actor_user_id    String?
+  event_type       LedgerEventType
+  amount_usdc      Decimal?
+  currency         String          @default("USDC")
+  reference_tx     String?
+  metadata         Json?
+  entry_hash       String
+  previous_hash    String?
+  created_at       DateTime        @default(now())
+
+  trade Trade @relation(fields: [trade_id], references: [id], onDelete: Cascade)
+
+  @@index([trade_id, created_at])
+  @@map("ledger_entries")
 }
 
 model TradeMessage {

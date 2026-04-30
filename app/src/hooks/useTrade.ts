@@ -12,11 +12,12 @@ async function apiFetch(
   token: string,
   options: RequestInit = {}
 ) {
+  const hasFormDataBody = options.body instanceof FormData;
   const res = await fetch(url, {
     ...options,
     headers: {
-      "Content-Type": "application/json",
       Authorization: `Bearer ${token}`,
+      ...(hasFormDataBody ? {} : { "Content-Type": "application/json" }),
       ...options.headers,
     },
   });
@@ -61,6 +62,10 @@ export function useTrades() {
     setError(null);
     try {
       const token = await getToken();
+      console.log("[frontend] token preview", {
+        length: token?.length,
+        start: token?.slice(0, 20),
+      });
       if (!token) throw new Error("Not authenticated");
       const data = await apiFetch("/api/trades", token);
       setTrades(data);
@@ -100,6 +105,10 @@ export function useTradeDetail(tradeId: string, inviteToken?: string | null) {
 
       try {
         const token = await getToken();
+        console.log("[frontend] token preview", {
+          length: token?.length,
+          start: token?.slice(0, 20),
+        });
         if (!token) throw new Error("Not authenticated");
         const inviteQuery = inviteToken
           ? `?invite_token=${encodeURIComponent(inviteToken)}`
@@ -140,6 +149,10 @@ export function useTradeActions() {
 
   async function getTokenOrThrow() {
     const token = await getToken();
+    console.log("[frontend] token preview", {
+      length: token?.length,
+      start: token?.slice(0, 20),
+    });
     if (!token) throw new Error("Not authenticated");
     return token;
   }
@@ -262,6 +275,76 @@ export function useTradeActions() {
     }
   }
 
+  async function rejectProof(
+    tradeId: string,
+    milestone_number: number,
+    reason: string
+  ): Promise<void> {
+    setLoading(true);
+    try {
+      const token = await getTokenOrThrow();
+      await apiFetch(`/api/trades/${tradeId}/proof/reject`, token, {
+        method: "POST",
+        body: JSON.stringify({ milestone_number, reason }),
+      });
+      toast.success("Proof rejected. Supplier must upload a new proof.");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Failed to reject proof";
+      toast.error(msg);
+      throw err;
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function uploadProofFile(
+    tradeId: string,
+    milestone_number: number,
+    file: File,
+    anchorFn?: (proofHashSha256: string) => Promise<string>
+  ): Promise<void> {
+    setLoading(true);
+    try {
+      const token = await getTokenOrThrow();
+      const form = new FormData();
+      form.append("file", file);
+      form.append("tradeId", tradeId);
+      form.append("milestoneNumber", String(milestone_number));
+
+      const uploadResponse = await apiFetch("/api/uploads/proof", token, {
+        method: "POST",
+        body: form,
+      });
+
+      const secureUrl = uploadResponse.secure_url as string | undefined;
+      const proofHash = uploadResponse.proof_hash_sha256 as string | undefined;
+      if (!secureUrl) {
+        throw new Error("Upload response missing secure_url");
+      }
+      if (!proofHash) {
+        throw new Error("Upload response missing proof_hash_sha256");
+      }
+      const proofAnchorTx = anchorFn ? await anchorFn(proofHash) : undefined;
+
+      await apiFetch(`/api/trades/${tradeId}/proof`, token, {
+        method: "POST",
+        body: JSON.stringify({
+          milestone_number,
+          proof_url: secureUrl,
+          proof_hash_sha256: proofHash,
+          proof_anchor_tx: proofAnchorTx,
+        }),
+      });
+      toast.success("Proof uploaded successfully");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Failed to upload proof";
+      toast.error(msg);
+      throw err;
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function recordRelease(
     tradeId: string,
     milestone_number: number,
@@ -312,6 +395,8 @@ export function useTradeActions() {
     declineTrade,
     recordFunding,
     uploadProof,
+    uploadProofFile,
+    rejectProof,
     recordRelease,
     openDispute,
   };

@@ -68,8 +68,9 @@ export function PrivyProvider({ children }: { children: React.ReactNode }) {
         },
         loginMethods: ["email", "wallet", "google"],
         embeddedWallets: {
+          showWalletUIs: false,
           solana: {
-            createOnLogin: "users-without-wallets",
+            createOnLogin: "all-users",
           },
         },
         externalWallets: {

@@ -10,6 +10,7 @@ import {
 import { notifyDisputeRaised } from "@/lib/telegram/notifications";
 import { assertChainBackedTx } from "@/lib/solana/verify";
 import type { Trade } from "@/types";
+import { appendLedgerEntry } from "@/lib/ledger";
 
 type Context = { params: { tradeId: string } };
 
@@ -105,6 +106,18 @@ export const POST = withAuth(async (req: AuthedRequest, ctx: Context) => {
       trade.buyer_id === req.user.id ? "buyer" : "supplier",
       reason
     );
+
+    await appendLedgerEntry({
+      tradeId,
+      actorUserId: req.user.id,
+      eventType: "dispute_opened",
+      referenceTx: tx_signature,
+      metadata: {
+        dispute_id: dispute.id,
+        reason,
+        milestone_number: milestone_number ?? null,
+      },
+    });
 
     return NextResponse.json(dispute, { status: 201 });
   } catch (error) {

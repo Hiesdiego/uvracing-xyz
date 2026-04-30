@@ -20,6 +20,8 @@ pub enum TradeOSError {
     MilestoneOutOfOrder,
     #[msg("Only the arbiter can perform this action")]
     UnauthorizedArbiter,
+    #[msg("Only the buyer can release milestones")]
+    UnauthorizedBuyerRelease,
     #[msg("Only the buyer or supplier can raise a dispute")]
     UnauthorizedDispute,
     #[msg("Only the buyer can request a refund")]

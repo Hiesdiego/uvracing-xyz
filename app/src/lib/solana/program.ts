@@ -1,10 +1,23 @@
-import { Connection, PublicKey } from "@solana/web3.js";
-import { AnchorProvider, Program, setProvider, type Idl } from "@coral-xyz/anchor";
-import { RPC_URL, PROGRAM_ID } from "@/lib/constants";
+// app/src/lib/solana/program.ts
+
+import {
+  Connection,
+  PublicKey,
+  Transaction,
+  VersionedTransaction,
+} from "@solana/web3.js";
+import {
+  AnchorProvider,
+  Program,
+  setProvider,
+  type Idl,
+} from "@coral-xyz/anchor";
+import { RPC_URL, RPC_WS_URL, PROGRAM_ID } from "@/lib/constants";
 import idl from "./idl.json";
 
 export type TradeosIDL = Idl;
 const tradeosIdl = idl as unknown as Idl;
+let sharedConnection: Connection | null = null;
 
 /**
  * PDA seed chunks must be <= 32 bytes.
@@ -15,9 +28,82 @@ export function normalizeTradeSeed(tradeId: string): string {
   return compact.length <= 32 ? compact : compact.slice(0, 32);
 }
 
-/** Returns a read-only Anchor connection — no wallet needed */
+/** Returns a read-only Anchor connection (no wallet needed). */
 export function getConnection(): Connection {
-  return new Connection(RPC_URL, "confirmed");
+  if (sharedConnection) return sharedConnection;
+  sharedConnection = new Connection(RPC_URL, {
+    commitment: "confirmed",
+    wsEndpoint: RPC_WS_URL,
+  });
+  return sharedConnection;
+}
+
+/** Best-effort websocket cleanup for app unmount/HMR/reloads. */
+export function cleanupConnection(): void {
+  if (!sharedConnection) return;
+  const maybeWs = (sharedConnection as unknown as { _rpcWebSocket?: { close?: () => void } })
+    ._rpcWebSocket;
+  if (maybeWs && typeof maybeWs.close === "function") {
+    try {
+      maybeWs.close();
+    } catch {
+      // noop
+    }
+  }
+  sharedConnection = null;
+}
+
+// ---------------------------------------------------------------------------
+// buildAnchorWallet
+//
+// Anchor and Privy (in this app stack) expect Transaction-like objects as
+// signing inputs. Keep return handling flexible in case a wallet adapter
+// returns signed bytes instead of a transaction object.
+// ---------------------------------------------------------------------------
+function buildAnchorWallet(wallet: {
+  publicKey: PublicKey;
+  signTransaction: (tx: unknown) => Promise<unknown>;
+  signAllTransactions: (txs: unknown[]) => Promise<unknown[]>;
+}) {
+  async function signOne<T extends Transaction | VersionedTransaction>(
+    tx: T
+  ): Promise<T> {
+    const isVersioned = tx instanceof VersionedTransaction;
+    const result = await wallet.signTransaction(tx);
+
+    // Wallet adapters may return:
+    //   (a) signed bytes -> deserialize to Transaction/VersionedTransaction
+    //   (b) Transaction / VersionedTransaction directly
+    const isBytes =
+      result instanceof Uint8Array ||
+      ArrayBuffer.isView(result) ||
+      (result != null &&
+        typeof result === "object" &&
+        "byteLength" in (result as object) &&
+        !("serialize" in (result as object)));
+
+    if (isBytes) {
+      const signedBytes = result as Uint8Array;
+      if (isVersioned) {
+        return VersionedTransaction.deserialize(signedBytes) as T;
+      }
+      return Transaction.from(signedBytes) as T;
+    }
+
+    return result as T;
+  }
+
+  return {
+    publicKey: wallet.publicKey,
+
+    signTransaction: <T extends Transaction | VersionedTransaction>(
+      tx: T
+    ): Promise<T> => signOne(tx),
+
+    signAllTransactions: <T extends Transaction | VersionedTransaction>(
+      txs: T[]
+    ): Promise<T[]> => Promise.all(txs.map((tx) => signOne(tx))),
+  };
 }
 
 /**
@@ -26,7 +112,6 @@ export function getConnection(): Connection {
  */
 export function getReadonlyProgram(): Program<TradeosIDL> {
   const connection = getConnection();
-  // Dummy wallet for read-only — never signs anything
   const dummyWallet = {
     publicKey: PublicKey.default,
     signTransaction: async (tx: unknown) => tx,
@@ -41,7 +126,7 @@ export function getReadonlyProgram(): Program<TradeosIDL> {
 
 /**
  * Returns an Anchor program instance bound to a signing wallet.
- * Used for all instructions that need a signature.
+ * buildAnchorWallet keeps signing input/output compatible across adapters.
  */
 export function getSigningProgram(wallet: {
   publicKey: PublicKey;
@@ -49,7 +134,9 @@ export function getSigningProgram(wallet: {
   signAllTransactions: (txs: unknown[]) => Promise<unknown[]>;
 }): Program<TradeosIDL> {
   const connection = getConnection();
-  const provider = new AnchorProvider(connection, wallet as never, {
+  const anchorWallet = buildAnchorWallet(wallet);
+
+  const provider = new AnchorProvider(connection, anchorWallet as never, {
     commitment: "confirmed",
     preflightCommitment: "confirmed",
   });
@@ -67,7 +154,9 @@ export function deriveEscrowPda(tradeId: string): [PublicKey, number] {
 }
 
 /** Derive the escrow token account PDA from the escrow PDA */
-export function deriveEscrowTokenPda(escrowPda: PublicKey): [PublicKey, number] {
+export function deriveEscrowTokenPda(
+  escrowPda: PublicKey
+): [PublicKey, number] {
   return PublicKey.findProgramAddressSync(
     [Buffer.from("escrow_token"), escrowPda.toBuffer()],
     new PublicKey(PROGRAM_ID)
@@ -75,7 +164,9 @@ export function deriveEscrowTokenPda(escrowPda: PublicKey): [PublicKey, number] 
 }
 
 /** Derive the milestone config PDA from the escrow PDA */
-export function deriveMilestoneConfigPda(escrowPda: PublicKey): [PublicKey, number] {
+export function deriveMilestoneConfigPda(
+  escrowPda: PublicKey
+): [PublicKey, number] {
   return PublicKey.findProgramAddressSync(
     [Buffer.from("milestones"), escrowPda.toBuffer()],
     new PublicKey(PROGRAM_ID)

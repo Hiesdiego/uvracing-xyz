@@ -1,3 +1,5 @@
+// app/src/lib/solana/escrow.ts
+
 import {
   PublicKey,
   SystemProgram,
@@ -240,6 +242,7 @@ export async function releaseMilestone({
   supplierWallet: string;
 }): Promise<string> {
   const program = getSigningProgram(wallet);
+  const connection = getConnection();
 
   const [escrowPda] = deriveEscrowPda(tradeId);
   const [escrowTokenPda] = deriveEscrowTokenPda(escrowPda);
@@ -248,12 +251,32 @@ export async function releaseMilestone({
   const supplierPubkey = new PublicKey(supplierWallet);
 
   const supplierAta = await getAssociatedTokenAddress(usdcMint, supplierPubkey);
+  const supplierAtaInfo = await connection.getAccountInfo(supplierAta);
+  const preInstructions = [];
+
+  if (!supplierAtaInfo) {
+    console.log(
+      "[escrow/releaseMilestone] Supplier ATA missing - will create it",
+      {
+        supplier: supplierPubkey.toBase58(),
+        supplierAta: supplierAta.toBase58(),
+      }
+    );
+    preInstructions.push(
+      createAssociatedTokenAccountInstruction(
+        wallet.publicKey,
+        supplierAta,
+        supplierPubkey,
+        usdcMint
+      )
+    );
+  }
 
   return simulateAndSurface("releaseMilestone", () =>
     program.methods
       .releaseMilestone(milestoneIndex)
       .accounts({
-        arbiter: wallet.publicKey,
+        buyer: wallet.publicKey,
         escrow: escrowPda,
         milestoneConfig: milestoneConfigPda,
         escrowTokenAccount: escrowTokenPda,
@@ -261,6 +284,7 @@ export async function releaseMilestone({
         tokenProgram: TOKEN_PROGRAM_ID,
         systemProgram: SystemProgram.programId,
       })
+      .preInstructions(preInstructions)
       .rpc({ commitment: "confirmed" })
   );
 }

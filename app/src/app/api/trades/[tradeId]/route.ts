@@ -8,18 +8,34 @@ import { safeJson, validationErrorResponse } from "@/lib/api/validation";
 import {
   PrivyClient,
   type LinkedAccount,
+  type User as PrivyUser,
 } from "@privy-io/node";
 
 type Context = { params: { tradeId: string } };
 type GetContext = { params: Promise<{ tradeId: string }> };
+
+const privyAppId = process.env.NEXT_PUBLIC_PRIVY_APP_ID?.trim();
+const privyAppSecret = process.env.PRIVY_APP_SECRET?.trim();
+
+console.log("[withAuth] ENV CHECK", {
+  appId: process.env.NEXT_PUBLIC_PRIVY_APP_ID,
+  secretLength: process.env.PRIVY_APP_SECRET?.length,
+});
+
+if (!privyAppId || !privyAppSecret) {
+  console.error(
+    "Privy app ID or secret not provided. Please set NEXT_PUBLIC_PRIVY_APP_ID and PRIVY_APP_SECRET."
+  );
+  throw new Error("Privy app ID or secret not provided");
+}
 
 /**
  * Single PrivyClient instance — reused across requests.
  * JWT verification is local (no network). Creating this per-request is wasteful.
  */
 const privy = new PrivyClient({
-  appId: process.env.NEXT_PUBLIC_PRIVY_APP_ID!,
-  appSecret: process.env.PRIVY_APP_SECRET!,
+  appId: privyAppId!,
+  appSecret: privyAppSecret!,
 });
 
 type PrivyLinkedAccount = LinkedAccount & {
@@ -27,12 +43,33 @@ type PrivyLinkedAccount = LinkedAccount & {
   address?: string;
 };
 
-function findSolanaWallet(linkedAccounts: LinkedAccount[]): string | null {
-  const accounts = linkedAccounts as PrivyLinkedAccount[];
-  const solana = accounts.find(
-    (a) => a.type === "wallet" && a.chain_type === "solana"
+type PrivyEmailAccount = Extract<LinkedAccount, { type: "email" }>;
+
+function getSolanaWalletAddress(privyUser: PrivyUser): string | undefined {
+  const accounts = privyUser.linked_accounts as PrivyLinkedAccount[];
+
+  // 1) Prefer standard embedded wallet
+  const embedded = accounts.find(
+    (a) => a.type === "wallet" && a.chain_type === "solana" && a.address
   );
-  return solana?.address ?? null;
+  if (embedded?.address) return embedded.address;
+
+  // 2) Fall back to AA wallet (type may be undefined)
+  const aa = accounts.find(
+    (a) =>
+      a.chain_type === "solana" &&
+      a.address != null &&
+      a.address.length >= 32
+  );
+  return aa?.address;
+}
+
+function getEmailAddress(privyUser: PrivyUser): string | null {
+  return (
+    privyUser.linked_accounts.find(
+      (account): account is PrivyEmailAccount => account.type === "email"
+    )?.address ?? null
+  );
 }
 
 async function resolveOptionalAuthWallet(token: string) {
@@ -60,10 +97,11 @@ async function resolveOptionalAuthWallet(token: string) {
       .auth()
       .verifyAccessToken(token);
     const privyDid = verifiedClaims.user_id;
-    const privyUser = await privy.users().get(privyDid);
+    const privyUser = await privy.users()._get(privyDid);
     return {
       privyDid,
-      walletAddress: findSolanaWallet(privyUser.linked_accounts ?? []),
+      walletAddress: getSolanaWalletAddress(privyUser) ?? null,
+      email: getEmailAddress(privyUser),
       verificationMethod: "verifyAccessToken" as const,
     };
   } catch {
@@ -78,13 +116,15 @@ async function resolveOptionalAuthWallet(token: string) {
       return {
         privyDid: undefined,
         walletAddress: null,
+        email: null,
         verificationMethod: "verifyAuthToken" as const,
       };
     }
-    const privyUser = await privy.users().get(privyDid);
+    const privyUser = await privy.users()._get(privyDid);
     return {
       privyDid,
-      walletAddress: findSolanaWallet(privyUser.linked_accounts ?? []),
+      walletAddress: getSolanaWalletAddress(privyUser) ?? null,
+      email: getEmailAddress(privyUser),
       verificationMethod: "verifyAuthToken" as const,
     };
   }
@@ -96,7 +136,7 @@ async function getOptionalAuthedUser(req: NextRequest) {
 
   try {
     const token = authHeader.replace("Bearer ", "");
-    const { privyDid, walletAddress, verificationMethod } =
+    const { privyDid, walletAddress, email, verificationMethod } =
       await resolveOptionalAuthWallet(token);
 
     if (!walletAddress) {
@@ -109,8 +149,8 @@ async function getOptionalAuthedUser(req: NextRequest) {
 
     const user = await prisma.user.upsert({
       where: { wallet_address: walletAddress },
-      create: { wallet_address: walletAddress },
-      update: {},
+      create: { wallet_address: walletAddress, email },
+      update: { email },
     });
     if (process.env.NODE_ENV === "development") {
       console.log("[GET /api/trades/[tradeId]] optional auth resolved", {

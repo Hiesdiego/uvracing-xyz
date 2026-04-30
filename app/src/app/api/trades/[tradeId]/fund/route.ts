@@ -8,6 +8,7 @@ import {
 } from "@/lib/api/validation";
 import { assertEscrowFundingTx } from "@/lib/solana/verify";
 import { USDC_FACTOR, USDC_MINT } from "@/lib/constants";
+import { appendLedgerEntry } from "@/lib/ledger";
 
 type Context = { params: { tradeId: string } };
 
@@ -72,6 +73,15 @@ export const POST = withAuth(async (req: AuthedRequest, ctx: Context) => {
         supplier: true,
         milestones: { orderBy: { milestone_number: "asc" } },
       },
+    });
+
+    await appendLedgerEntry({
+      tradeId,
+      actorUserId: req.user.id,
+      eventType: "escrow_funded",
+      amountUsdc: Number(trade.total_amount_usdc),
+      referenceTx: tx_signature,
+      metadata: { escrow_pubkey },
     });
 
     return NextResponse.json(updated);

@@ -2,6 +2,7 @@
 
 "use client";
 
+import { useEffect, useState } from "react";
 import { usePrivy } from "@privy-io/react-auth";
 import Link from "next/link";
 import {
@@ -11,8 +12,12 @@ import {
   CheckCircle2,
   AlertTriangle,
   PlusCircle,
-  ExternalLink,
+  TrendingUp,
+  TrendingDown,
+  Download,
   Wallet,
+  Landmark,
+  Scale,
 } from "lucide-react";
 import { useTrades } from "@/hooks/useTrade";
 import { Button } from "@/components/ui/button";
@@ -109,8 +114,11 @@ function TradeRow({ trade }: { trade: Trade }) {
 }
 
 export default function DashboardPage() {
-  const { user } = usePrivy();
+  const { user, getAccessToken } = usePrivy();
   const { trades, loading } = useTrades();
+  const [risk, setRisk] = useState<{
+    my_risk?: { score: number; tier: "low" | "medium" | "high" };
+  } | null>(null);
 
   const activeTrades = trades.filter(
     (t) =>
@@ -150,9 +158,84 @@ export default function DashboardPage() {
     return sum + lockedAmount;
   }, 0);
   const completedTrades = trades.filter((t) => t.status === "completed");
+  const settledVolume = trades
+    .filter((t) => ["completed", "in_progress", "milestone_1_released", "milestone_2_released"].includes(t.status))
+    .reduce((sum, t) => sum + Number(t.total_amount_usdc), 0);
+  const disputedExposure = trades
+    .filter((t) => t.status === "disputed")
+    .reduce((sum, t) => sum + Number(t.total_amount_usdc), 0);
+  const refundedVolume = trades
+    .filter((t) => t.status === "refunded")
+    .reduce((sum, t) => sum + Number(t.total_amount_usdc), 0);
+  const releasedVolume = trades.reduce((sum, trade) => {
+    const released =
+      trade.milestones?.reduce((acc, m) => {
+        if (m.status !== "released") return acc;
+        return acc + (Number(trade.total_amount_usdc) * m.release_percentage) / 100;
+      }, 0) ?? 0;
+    return sum + released;
+  }, 0);
+  const netRealizedFlow = releasedVolume - refundedVolume;
+  const avgDaysToRelease = (() => {
+    const values = trades.flatMap((trade) =>
+      (trade.milestones ?? [])
+        .filter((m) => m.released_at)
+        .map((m) => {
+          const created = new Date(trade.created_at).getTime();
+          const released = new Date(m.released_at as string).getTime();
+          if (!Number.isFinite(created) || !Number.isFinite(released)) return null;
+          const days = (released - created) / (1000 * 60 * 60 * 24);
+          return days >= 0 ? days : null;
+        })
+        .filter((v): v is number => v != null)
+    );
+    if (!values.length) return 0;
+    return values.reduce((a, b) => a + b, 0) / values.length;
+  })();
 
   const displayName =
     user?.email?.address?.split("@")[0] ?? "Merchant";
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const token = await getAccessToken();
+        if (!token) return;
+        const res = await fetch("/api/treasury/risk", {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (!res.ok) return;
+        const data = await res.json();
+        if (!cancelled) setRisk(data);
+      } catch {
+        // noop
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [getAccessToken]);
+
+  async function exportTreasuryCsv() {
+    const token = await getAccessToken();
+    if (!token) return;
+
+    const res = await fetch("/api/treasury/export", {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return;
+
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `tradeos_treasury_${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
 
   return (
     <div className="space-y-8 animate-fade-in">
@@ -177,6 +260,36 @@ export default function DashboardPage() {
           </Link>
         </Button>
       </div>
+      <div className="flex justify-end">
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={exportTreasuryCsv}
+          className="text-xs"
+        >
+          <Download className="w-3 h-3 mr-1.5" />
+          Export Treasury CSV
+        </Button>
+      </div>
+      {risk?.my_risk && (
+        <div className="flex items-center gap-2 text-xs">
+          <Badge variant="outline" className="border-red-400/30">
+            Anti-Fraud Score: {risk.my_risk.score}/100
+          </Badge>
+          <Badge
+            variant="outline"
+            className={
+              risk.my_risk.tier === "high"
+                ? "border-red-400/40 text-red-300"
+                : risk.my_risk.tier === "medium"
+                ? "border-yellow-400/40 text-yellow-300"
+                : "border-green-400/40 text-green-300"
+            }
+          >
+            Risk Tier: {risk.my_risk.tier}
+          </Badge>
+        </div>
+      )}
 
       {/* Stats */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
@@ -212,6 +325,56 @@ export default function DashboardPage() {
             />
           </>
         )}
+      </div>
+
+      {/* Treasury */}
+      <div className="space-y-3">
+        <div className="flex items-center justify-between">
+          <h2 className="text-sm font-semibold text-muted-foreground uppercase tracking-wider">
+            Treasury Dashboard
+          </h2>
+          <Badge variant="outline" className="text-[10px] border-[hsl(var(--gold)/0.3)] text-gold">
+            Merchant Finance
+          </Badge>
+        </div>
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+          <StatCard
+            label="Settled Volume"
+            value={`$${formatUsdc(settledVolume)}`}
+            icon={Landmark}
+            sub="completed + released trade flow"
+          />
+          <StatCard
+            label="Released to Suppliers"
+            value={`$${formatUsdc(releasedVolume)}`}
+            icon={TrendingUp}
+            sub="milestone payouts"
+          />
+          <StatCard
+            label="Refunded to Buyers"
+            value={`$${formatUsdc(refundedVolume)}`}
+            icon={TrendingDown}
+            sub="capital returned"
+          />
+          <StatCard
+            label="Disputed Exposure"
+            value={`$${formatUsdc(disputedExposure)}`}
+            icon={Scale}
+            sub="value currently disputed"
+          />
+          <StatCard
+            label="Net Realized Flow"
+            value={`$${formatUsdc(netRealizedFlow)}`}
+            icon={ArrowLeftRight}
+            sub="released minus refunded"
+          />
+          <StatCard
+            label="Avg Milestone Release"
+            value={`${avgDaysToRelease.toFixed(1)}d`}
+            icon={Clock}
+            sub="trade create -> milestone release"
+          />
+        </div>
       </div>
 
       {/* Pending actions banner */}

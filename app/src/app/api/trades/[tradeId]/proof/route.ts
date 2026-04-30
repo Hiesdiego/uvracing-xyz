@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { withAuth, type AuthedRequest } from "@/lib/auth/withAuth";
 import { prisma } from "@/lib/db/prisma";
+import { appendLedgerEntry } from "@/lib/ledger";
 
 type Context = { params: { tradeId: string } };
 
@@ -8,11 +9,17 @@ type Context = { params: { tradeId: string } };
 export const POST = withAuth(async (req: AuthedRequest, ctx: Context) => {
   const { tradeId } = ctx.params;
   const body = await req.json();
-  const { milestone_number, proof_url } = body;
+  const { milestone_number, proof_url, proof_hash_sha256, proof_anchor_tx } = body;
 
-  if (!milestone_number || !proof_url) {
+  if (!milestone_number || !proof_url || !proof_hash_sha256) {
     return NextResponse.json(
-      { error: "milestone_number and proof_url are required" },
+      { error: "milestone_number, proof_url and proof_hash_sha256 are required" },
+      { status: 400 }
+    );
+  }
+  if (!/^[a-f0-9]{64}$/i.test(String(proof_hash_sha256))) {
+    return NextResponse.json(
+      { error: "proof_hash_sha256 must be a valid SHA-256 hex string" },
       { status: 400 }
     );
   }
@@ -64,8 +71,28 @@ export const POST = withAuth(async (req: AuthedRequest, ctx: Context) => {
     where: { id: milestone.id },
     data: {
       proof_url,
+      proof_hash_sha256,
+      proof_anchor_tx: proof_anchor_tx ?? null,
+      proof_rejection_reason: null,
+      proof_rejected_at: null,
+      proof_version: { increment: 1 },
       proof_uploaded_at: new Date(),
       status: "proof_uploaded",
+    },
+  });
+
+  await appendLedgerEntry({
+    tradeId,
+    actorUserId: req.user.id,
+    eventType: "proof_uploaded",
+    amountUsdc: Number(milestone.release_amount_usdc ?? 0),
+    referenceTx: proof_anchor_tx ?? null,
+    metadata: {
+      milestone_number: Number(milestone_number),
+      proof_url,
+      proof_hash_sha256,
+      proof_anchor_tx: proof_anchor_tx ?? null,
+      proof_version: updated.proof_version,
     },
   });
 

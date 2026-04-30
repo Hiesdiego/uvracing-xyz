@@ -50,18 +50,20 @@ function MilestoneStep({
   onProofUpload,
   onRelease,
   onDispute,
+  onRejectProof,
   actionLoading,
 }: {
   milestone: Milestone;
   trade: Trade;
   isBuyer: boolean;
   isSupplier: boolean;
-  onProofUpload: (milestoneNumber: number, url: string) => void;
+  onProofUpload: (milestoneNumber: number, file: File) => void;
   onRelease: (milestoneNumber: number) => void;
   onDispute: (milestoneNumber: number) => void;
+  onRejectProof: (milestoneNumber: number) => void;
   actionLoading: boolean;
 }) {
-  const [proofUrl, setProofUrl] = useState("");
+  const [proofFile, setProofFile] = useState<File | null>(null);
   const [showProofInput, setShowProofInput] = useState(false);
 
   const releaseAmount = trade.total_amount_usdc
@@ -162,6 +164,11 @@ function MilestoneStep({
             View shipping proof
           </a>
         )}
+        {milestone.proof_rejection_reason && (
+          <p className="text-xs text-yellow-300/90 mb-3">
+            Proof feedback: {milestone.proof_rejection_reason}
+          </p>
+        )}
 
         <div className="flex flex-wrap gap-2">
           {isSupplier &&
@@ -176,21 +183,23 @@ function MilestoneStep({
                 {showProofInput ? (
                   <div className="flex items-center gap-2 w-full">
                     <Input
-                      placeholder="https://cloudinary.com/your-document-url"
-                      value={proofUrl}
-                      onChange={(e) => setProofUrl(e.target.value)}
-                      className="bg-input border-border text-xs h-8 flex-1"
+                      type="file"
+                      accept=".pdf,image/png,image/jpeg,image/webp"
+                      onChange={(e) =>
+                        setProofFile(e.target.files?.[0] ?? null)
+                      }
+                      className="bg-input border-border text-xs h-8 flex-1 file:mr-2 file:text-xs"
                     />
                     <Button
                       size="sm"
                       onClick={() => {
-                        if (proofUrl.trim()) {
-                          onProofUpload(milestone.milestone_number, proofUrl);
+                        if (proofFile) {
+                          onProofUpload(milestone.milestone_number, proofFile);
                           setShowProofInput(false);
-                          setProofUrl("");
+                          setProofFile(null);
                         }
                       }}
-                      disabled={actionLoading || !proofUrl.trim()}
+                      disabled={actionLoading || !proofFile}
                       className="h-8 text-xs gradient-gold text-black font-semibold hover:opacity-90"
                     >
                       Submit
@@ -198,7 +207,10 @@ function MilestoneStep({
                     <Button
                       size="sm"
                       variant="outline"
-                      onClick={() => setShowProofInput(false)}
+                      onClick={() => {
+                        setShowProofInput(false);
+                        setProofFile(null);
+                      }}
                       className="h-8 text-xs"
                     >
                       Cancel
@@ -227,6 +239,16 @@ function MilestoneStep({
               >
                 <Unlock className="w-3 h-3 mr-1" />
                 Approve and Release
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => onRejectProof(milestone.milestone_number)}
+                disabled={actionLoading}
+                className="h-7 text-xs border-yellow-400/40 text-yellow-400 hover:bg-yellow-400/10"
+              >
+                <AlertTriangle className="w-3 h-3 mr-1" />
+                Reject Proof
               </Button>
               <Button
                 size="sm"
@@ -291,7 +313,8 @@ export default function TradeDetailPage({
   );
   const {
     recordFunding,
-    uploadProof,
+    uploadProofFile,
+    rejectProof,
     recordRelease,
     acceptTrade,
     declineTrade,
@@ -300,6 +323,7 @@ export default function TradeDetailPage({
   const {
     handleFundEscrow,
     handleReleaseMilestone,
+    anchorProofAttestation,
     walletReady,
     loading: chainLoading,
   } = useEscrow();
@@ -477,13 +501,31 @@ export default function TradeDetailPage({
     [trade, router]
   );
 
-  const onProofUpload = useCallback(
-    async (milestoneNumber: number, url: string) => {
+  const onRejectProof = useCallback(
+    async (milestoneNumber: number) => {
       if (!trade) return;
-      await uploadProof(trade.id, milestoneNumber, url);
+      const reason = window.prompt(
+        `Why are you rejecting milestone ${milestoneNumber} proof?`
+      );
+      if (!reason || !reason.trim()) return;
+      await rejectProof(trade.id, milestoneNumber, reason.trim());
       refetch();
     },
-    [trade, uploadProof, refetch]
+    [trade, rejectProof, refetch]
+  );
+
+  const onProofUpload = useCallback(
+    async (milestoneNumber: number, file: File) => {
+      if (!trade) return;
+      await uploadProofFile(
+        trade.id,
+        milestoneNumber,
+        file,
+        (proofHash) => anchorProofAttestation(trade.id, milestoneNumber, proofHash)
+      );
+      refetch();
+    },
+    [trade, uploadProofFile, anchorProofAttestation, refetch]
   );
 
   // ---------------------------------------------------------------------------
@@ -808,17 +850,18 @@ export default function TradeDetailPage({
         {trade.milestones && trade.milestones.length > 0 ? (
           <div>
             {trade.milestones.map((milestone) => (
-              <MilestoneStep
-                key={milestone.id}
-                milestone={milestone}
-                trade={trade}
-                isBuyer={isBuyer}
-                isSupplier={isSupplier}
-                onProofUpload={onProofUpload}
-                onRelease={onRelease}
-                onDispute={onDispute}
-                actionLoading={actionLoading}
-              />
+                <MilestoneStep
+                  key={milestone.id}
+                  milestone={milestone}
+                  trade={trade}
+                  isBuyer={isBuyer}
+                  isSupplier={isSupplier}
+                  onProofUpload={onProofUpload}
+                  onRelease={onRelease}
+                  onDispute={onDispute}
+                  onRejectProof={onRejectProof}
+                  actionLoading={actionLoading}
+                />
             ))}
           </div>
         ) : (

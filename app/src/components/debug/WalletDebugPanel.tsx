@@ -5,11 +5,6 @@
  *
  * Drop this anywhere in your app to see the full wallet + RPC + program state.
  * Add it to the trade detail page while debugging, remove before production.
- *
- * Usage in [tradeId]/page.tsx:
- *   import { WalletDebugPanel } from "@/components/debug/WalletDebugPanel";
- *   // anywhere in the JSX:
- *   {process.env.NODE_ENV === "development" && <WalletDebugPanel tradeId={tradeId} />}
  */
 
 import { useEffect, useRef, useState, useCallback } from "react";
@@ -41,11 +36,11 @@ function Row({ check }: { check: Check }) {
   }[check.status];
 
   const dot = {
-    ok: "●",
-    warn: "▲",
-    error: "✖",
-    loading: "◌",
-    info: "·",
+    ok: "o",
+    warn: "^",
+    error: "x",
+    loading: "~",
+    info: ".",
   }[check.status];
 
   return (
@@ -62,6 +57,7 @@ export function WalletDebugPanel({ tradeId }: { tradeId?: string }) {
   const { wallets } = useWallets();
   const [checks, setChecks] = useState<Check[]>([]);
   const [running, setRunning] = useState(false);
+  const [open, setOpen] = useState(false);
   const runRef = useRef(false);
 
   const runDiagnostics = useCallback(async () => {
@@ -71,7 +67,6 @@ export function WalletDebugPanel({ tradeId }: { tradeId?: string }) {
 
     const results: Check[] = [];
 
-    // ── 1. Privy state ───────────────────────────────────────────────────────
     results.push({
       label: "Privy ready",
       status: ready ? "ok" : "error",
@@ -84,7 +79,6 @@ export function WalletDebugPanel({ tradeId }: { tradeId?: string }) {
       value: String(authenticated),
     });
 
-    // ── 2. Wallets ───────────────────────────────────────────────────────────
     results.push({
       label: "wallets[] length",
       status: wallets.length > 0 ? "ok" : "error",
@@ -93,11 +87,28 @@ export function WalletDebugPanel({ tradeId }: { tradeId?: string }) {
 
     wallets.forEach((w, i) => {
       const walletType = (w as { walletClientType?: string }).walletClientType ?? "unknown";
-      const isEmbedded = walletType === "privy";
+      const connectorType = (w as { connectorType?: string }).connectorType ?? "unknown";
+      const meta = (w as { meta?: { id?: string; name?: string } }).meta;
+      const standardWallet = (w as { standardWallet?: { name?: string; isPrivyWallet?: boolean } })
+        .standardWallet;
+      const isEmbedded =
+        walletType === "privy" ||
+        standardWallet?.isPrivyWallet === true ||
+        standardWallet?.name === "Privy";
       results.push({
         label: `wallet[${i}] type`,
         status: isEmbedded ? "ok" : "warn",
-        value: `${walletType}${isEmbedded ? " (embedded ✓ use this)" : " (external — may conflict)"}`,
+        value: `${walletType}${isEmbedded ? " (embedded: use this)" : " (external: may conflict)"}`,
+      });
+      results.push({
+        label: `wallet[${i}] connector/meta`,
+        status: "info",
+        value: `${connectorType} | ${meta?.id ?? "no-meta-id"}${meta?.name ? ` (${meta.name})` : ""}`,
+      });
+      results.push({
+        label: `wallet[${i}] standard wallet`,
+        status: "info",
+        value: `${standardWallet?.name ?? "unknown"} | isPrivy=${String(standardWallet?.isPrivyWallet ?? false)}`,
       });
       results.push({
         label: `wallet[${i}] address`,
@@ -106,17 +117,25 @@ export function WalletDebugPanel({ tradeId }: { tradeId?: string }) {
       });
     });
 
-    // Detect the embedded wallet specifically
     const embeddedWallet = wallets.find(
-      (w) => (w as { walletClientType?: string }).walletClientType === "privy"
+      (w) => {
+        const typed = w as {
+          walletClientType?: string;
+          standardWallet?: { name?: string; isPrivyWallet?: boolean };
+        };
+        return (
+          typed.walletClientType === "privy" ||
+          typed.standardWallet?.isPrivyWallet === true ||
+          typed.standardWallet?.name === "Privy"
+        );
+      }
     );
     results.push({
       label: "embedded wallet found",
       status: embeddedWallet ? "ok" : "error",
-      value: embeddedWallet ? embeddedWallet.address : "NOT FOUND — user may not have embedded wallet yet",
+      value: embeddedWallet ? embeddedWallet.address : "NOT FOUND: user may not have embedded wallet yet",
     });
 
-    // user.linkedAccounts wallet
     const linkedWallet = user?.linkedAccounts?.find(
       (a) => a.type === "wallet"
     ) as { address?: string; chain_type?: string } | undefined;
@@ -128,23 +147,45 @@ export function WalletDebugPanel({ tradeId }: { tradeId?: string }) {
         : "NONE",
     });
 
-    // Check if embedded wallet address matches linked account
     if (embeddedWallet && linkedWallet?.address) {
       const match = embeddedWallet.address === linkedWallet.address;
       results.push({
         label: "embedded === linked account",
         status: match ? "ok" : "warn",
-        value: match ? "yes" : `NO — embedded: ${embeddedWallet.address?.slice(0, 8)} vs linked: ${linkedWallet.address?.slice(0, 8)}`,
+        value: match
+          ? "yes"
+          : `NO: embedded ${embeddedWallet.address?.slice(0, 8)} vs linked ${linkedWallet.address?.slice(0, 8)}`,
       });
     }
 
-    // ── 3. Access token ──────────────────────────────────────────────────────
+    if (wallets[0]) {
+      const firstWallet = wallets[0] as {
+        isConnected?: () => Promise<boolean>;
+      };
+      try {
+        const connected = await firstWallet.isConnected?.();
+        if (typeof connected === "boolean") {
+          results.push({
+            label: "wallet[0] isConnected()",
+            status: connected ? "ok" : "warn",
+            value: String(connected),
+          });
+        }
+      } catch (e) {
+        results.push({
+          label: "wallet[0] isConnected()",
+          status: "warn",
+          value: `THREW: ${e instanceof Error ? e.message : String(e)}`,
+        });
+      }
+    }
+
     try {
       const token = await getAccessToken();
       results.push({
         label: "getAccessToken()",
         status: token ? "ok" : "error",
-        value: token ? `obtained (${token.length} chars)` : "NULL — auth broken",
+        value: token ? `obtained (${token.length} chars)` : "NULL: auth broken",
       });
     } catch (e) {
       results.push({
@@ -154,7 +195,6 @@ export function WalletDebugPanel({ tradeId }: { tradeId?: string }) {
       });
     }
 
-    // ── 4. RPC connectivity ──────────────────────────────────────────────────
     results.push({
       label: "RPC_URL",
       status: RPC_URL ? "info" : "error",
@@ -179,7 +219,6 @@ export function WalletDebugPanel({ tradeId }: { tradeId?: string }) {
       });
     }
 
-    // ── 5. Env vars ──────────────────────────────────────────────────────────
     results.push({
       label: "PROGRAM_ID",
       status: PROGRAM_ID ? "ok" : "error",
@@ -196,7 +235,6 @@ export function WalletDebugPanel({ tradeId }: { tradeId?: string }) {
       value: ARBITER_WALLET ?? "NOT SET",
     });
 
-    // ── 6. Buyer SOL + USDC balances ─────────────────────────────────────────
     const buyerAddress = embeddedWallet?.address ?? linkedWallet?.address;
     if (buyerAddress) {
       try {
@@ -207,7 +245,7 @@ export function WalletDebugPanel({ tradeId }: { tradeId?: string }) {
         results.push({
           label: "buyer SOL balance",
           status: solBal > 5000 ? "ok" : "warn",
-          value: `${(solBal / LAMPORTS_PER_SOL).toFixed(5)} SOL${solBal < 5000 ? " ← too low for tx fees!" : ""}`,
+          value: `${(solBal / LAMPORTS_PER_SOL).toFixed(5)} SOL${solBal < 5000 ? " (too low for tx fees)" : ""}`,
         });
 
         if (USDC_MINT) {
@@ -238,7 +276,6 @@ export function WalletDebugPanel({ tradeId }: { tradeId?: string }) {
       }
     }
 
-    // ── 7. Escrow PDA (if tradeId provided) ─────────────────────────────────
     if (tradeId) {
       const seed = normalizeTradeSeed(tradeId);
       const [escrowPda] = deriveEscrowPda(tradeId);
@@ -285,39 +322,57 @@ export function WalletDebugPanel({ tradeId }: { tradeId?: string }) {
   }, [ready, authenticated, user, wallets, getAccessToken, tradeId]);
 
   useEffect(() => {
-    if (ready) runDiagnostics();
+    if (!open || !ready || checks.length > 0) return;
+    runDiagnostics();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ready]);
+  }, [open, ready, checks.length]);
 
   if (process.env.NODE_ENV === "production") return null;
 
   return (
-    <div className="fixed bottom-4 left-4 z-[9999] w-[680px] max-h-[80vh] overflow-y-auto rounded-xl border border-yellow-500/40 bg-black/95 p-4 shadow-2xl text-xs">
-      <div className="flex items-center justify-between mb-3">
-        <span className="text-yellow-400 font-bold text-sm">🔍 Wallet Debug Panel</span>
-        <div className="flex gap-2">
-          <button
-            onClick={runDiagnostics}
-            disabled={running}
-            className="px-2 py-1 rounded bg-yellow-500/20 text-yellow-400 hover:bg-yellow-500/30 transition-colors disabled:opacity-50"
-          >
-            {running ? "Running..." : "Re-run"}
-          </button>
+    <>
+      <button
+        type="button"
+        onClick={() => setOpen((prev) => !prev)}
+        className="fixed bottom-6 left-6 z-[9998] rounded-full border border-yellow-500/40 bg-black/90 px-3 py-2 text-xs font-semibold text-yellow-400 shadow-lg hover:bg-black"
+      >
+        {open ? "Close Debug" : "Wallet Debug"}
+      </button>
+
+      {open && (
+        <div className="fixed bottom-20 left-4 z-[9999] w-[min(92vw,680px)] max-h-[70vh] overflow-y-auto rounded-xl border border-yellow-500/40 bg-black/95 p-4 shadow-2xl text-xs">
+          <div className="mb-3 flex items-center justify-between">
+            <span className="text-sm font-bold text-yellow-400">Wallet Debug Panel</span>
+            <div className="flex gap-2">
+              <button
+                onClick={runDiagnostics}
+                disabled={running}
+                className="rounded bg-yellow-500/20 px-2 py-1 text-yellow-400 transition-colors hover:bg-yellow-500/30 disabled:opacity-50"
+              >
+                {running ? "Running..." : "Re-run"}
+              </button>
+              <button
+                onClick={() => setOpen(false)}
+                className="rounded border border-yellow-500/40 px-2 py-1 text-yellow-300 transition-colors hover:bg-yellow-500/15"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+
+          <div className="space-y-1.5">
+            {checks.length === 0 ? (
+              <span className="text-muted-foreground">Running diagnostics...</span>
+            ) : (
+              checks.map((c, i) => <Row key={i} check={c} />)
+            )}
+          </div>
+
+          <p className="mt-3 text-[10px] text-muted-foreground">
+            Remove this panel before going to production. {`process.env.NODE_ENV === "production"`} already hides it automatically.
+          </p>
         </div>
-      </div>
-
-      <div className="space-y-1.5">
-        {checks.length === 0 ? (
-          <span className="text-muted-foreground">Running diagnostics...</span>
-        ) : (
-          checks.map((c, i) => <Row key={i} check={c} />)
-        )}
-      </div>
-
-      <p className="mt-3 text-[10px] text-muted-foreground">
-        Remove this panel before going to production.{" "}
-        {`process.env.NODE_ENV === "production"`} already hides it automatically.
-      </p>
-    </div>
+      )}
+    </>
   );
 }
